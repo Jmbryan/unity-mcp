@@ -7,6 +7,7 @@ from fastmcp import Context
 from mcp.types import ToolAnnotations
 
 from services.registry import mcp_for_unity_tool
+from services.state import edit_ledger
 from services.tools import get_unity_instance_from_context
 from services.tools.utils import coerce_int, coerce_bool, parse_json_payload
 from transport.unity_transport import send_with_unity_instance
@@ -145,4 +146,8 @@ async def read_console(
                 _strip_stacktrace_from_list(data)
         except Exception:
             pass
+    if isinstance(resp, dict) and resp.get("success") and action == "get":
+        # Compile errors in the console get per-file last-editor attribution
+        # from the shared edit ledger (fail-open by contract: never raises).
+        await edit_ledger.annotate_compile_errors_for_context(ctx, unity_instance, resp)
     return resp if isinstance(resp, dict) else {"success": False, "message": str(resp)}

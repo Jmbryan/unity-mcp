@@ -16,6 +16,7 @@ from services.tools import get_unity_instance_from_context
 import transport.unity_transport as unity_transport
 import transport.legacy.unity_connection as _legacy_conn
 from transport.legacy.unity_connection import _extract_response_reason
+from services.state import edit_ledger
 from services.state.external_changes_scanner import external_changes_scanner
 import services.resources.editor_state as editor_state
 
@@ -24,6 +25,11 @@ logger = logging.getLogger(__name__)
 # Blocking reasons that indicate Unity is actually busy (not just stale status).
 # Must match activityPhase values from EditorStateCache.cs
 _REAL_BLOCKING_REASONS = {"compiling", "domain_reload", "running_tests", "asset_import"}
+
+# manage_script actions that change a script on disk. Successful sends with one
+# of these actions are recorded into the shared edit ledger so the compile
+# fence and error attribution see MCP edits alongside harness hook edits.
+_SCRIPT_EDIT_ACTIONS = {"create", "delete", "apply_text_edits", "edit"}
 
 
 def _in_pytest() -> bool:
@@ -132,6 +138,15 @@ async def send_mutation(
         if verified is not None:
             resp = verified
     await wait_for_editor_ready(ctx)
+    if (
+        command == "manage_script"
+        and isinstance(resp, dict)
+        and resp.get("success")
+        and str(params.get("action") or "").lower() in _SCRIPT_EDIT_ACTIONS
+    ):
+        # Fail-open by contract: record_mcp_edit never raises.
+        await edit_ledger.record_mcp_edit(
+            ctx, unity_instance, params.get("path"), params.get("name"))
     return resp
 
 
