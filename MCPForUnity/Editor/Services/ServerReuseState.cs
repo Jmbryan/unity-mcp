@@ -9,7 +9,7 @@ namespace MCPForUnity.Editor.Services
     /// which matches when "did this editor start or reuse the server?" can change (MCPL-013).
     /// The window/toolbar reads these to distinguish "reused" from "started by this editor".
     /// </summary>
-    internal static class ServerReuseState
+    public static class ServerReuseState
     {
         private const string KeyReused = "MCPForUnity.ServerReuse.Reused";
         private const string KeyVersion = "MCPForUnity.ServerReuse.Version";
