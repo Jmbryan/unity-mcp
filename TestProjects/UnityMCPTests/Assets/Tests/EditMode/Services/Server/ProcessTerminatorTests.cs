@@ -1,8 +1,77 @@
 using NUnit.Framework;
+using MCPForUnity.Editor.Services;
 using MCPForUnity.Editor.Services.Server;
+using MCPForUnity.Editor.Constants;
+using UnityEditor;
 
 namespace MCPForUnityTests.Editor.Services.Server
 {
+    /// <summary>
+    /// Tests for the quit-time shutdown gating (MCPL-002/003/004). The transport "goodbye" step
+    /// is unconditional in both toggle states; only the server-stop step is gated by the toggle.
+    /// These are non-Explicit (no process termination) so they run in the default EditMode suite.
+    /// </summary>
+    [TestFixture]
+    public class ShutdownCleanupGatingTests
+    {
+        private bool _savedStopOnQuit;
+        private bool _hadStopOnQuit;
+
+        [SetUp]
+        public void SetUp()
+        {
+            _hadStopOnQuit = EditorPrefs.HasKey(EditorPrefKeys.StopServerOnEditorQuit);
+            _savedStopOnQuit = EditorPrefs.GetBool(EditorPrefKeys.StopServerOnEditorQuit, false);
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            if (_hadStopOnQuit)
+            {
+                EditorPrefs.SetBool(EditorPrefKeys.StopServerOnEditorQuit, _savedStopOnQuit);
+            }
+            else
+            {
+                EditorPrefs.DeleteKey(EditorPrefKeys.StopServerOnEditorQuit);
+            }
+        }
+
+        [Test]
+        public void ShouldStopServerOnQuit_DefaultsOff_ServerSurvivesGracefulQuit()
+        {
+            // Arrange — fresh install: pref never set.
+            EditorPrefs.DeleteKey(EditorPrefKeys.StopServerOnEditorQuit);
+
+            // Act / Assert — the server-stop step is skipped, but the goodbye (step 1) still runs
+            // because it is outside this gate.
+            Assert.IsFalse(McpEditorShutdownCleanup.ShouldStopServerOnQuit(),
+                "Default OFF: graceful quit leaves the server running so live sessions survive.");
+        }
+
+        [Test]
+        public void ShouldStopServerOnQuit_ToggleOn_StopsServer()
+        {
+            // Arrange
+            EditorPrefs.SetBool(EditorPrefKeys.StopServerOnEditorQuit, true);
+
+            // Act / Assert
+            Assert.IsTrue(McpEditorShutdownCleanup.ShouldStopServerOnQuit(),
+                "Toggle ON restores legacy behavior: the server is stopped on graceful quit.");
+        }
+
+        [Test]
+        public void ShouldStopServerOnQuit_ToggleOff_SkipsStop()
+        {
+            // Arrange
+            EditorPrefs.SetBool(EditorPrefKeys.StopServerOnEditorQuit, false);
+
+            // Act / Assert
+            Assert.IsFalse(McpEditorShutdownCleanup.ShouldStopServerOnQuit(),
+                "Toggle OFF: the server-stop step is skipped.");
+        }
+    }
+
     /// <summary>
     /// Unit tests for ProcessTerminator component.
     /// Note: Most tests avoid actually terminating processes to prevent test instability.

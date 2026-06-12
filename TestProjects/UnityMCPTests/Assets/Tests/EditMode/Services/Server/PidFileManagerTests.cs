@@ -1,7 +1,9 @@
 using System.IO;
 using NUnit.Framework;
+using MCPForUnity.Editor.Services;
 using MCPForUnity.Editor.Services.Server;
 using MCPForUnity.Editor.Constants;
+using MCPForUnity.Editor.Windows.Components.Advanced;
 using UnityEditor;
 using UnityEngine;
 
@@ -487,6 +489,89 @@ namespace MCPForUnityTests.Editor.Services.Server
         {
             // Assert
             Assert.IsInstanceOf<IPidFileManager>(_manager);
+        }
+
+        #endregion
+
+        #region Server Reuse State Tests (MCPL-013)
+
+        [Test]
+        public void ServerReuseState_RecordStarted_ClearsReuseFlag()
+        {
+            // Act
+            ServerReuseState.RecordStarted();
+
+            // Assert
+            Assert.IsFalse(ServerReuseState.ReusedExistingServer, "Starting our own server is not a reuse.");
+            Assert.IsFalse(ServerReuseState.HasVersionMismatch);
+            Assert.AreEqual(string.Empty, ServerReuseState.ReusedServerVersion);
+        }
+
+        [Test]
+        public void ServerReuseState_RecordReused_RoundTripsFacts()
+        {
+            // Act
+            ServerReuseState.RecordReused("4.2.1", "2026-06-12T10:00:00.0000000Z", versionMismatch: true);
+
+            // Assert
+            Assert.IsTrue(ServerReuseState.ReusedExistingServer);
+            Assert.AreEqual("4.2.1", ServerReuseState.ReusedServerVersion);
+            Assert.AreEqual("2026-06-12T10:00:00.0000000Z", ServerReuseState.ReusedServerStartedAtIso);
+            Assert.IsTrue(ServerReuseState.HasVersionMismatch);
+
+            // Cleanup: reset to started so other tests/session aren't polluted.
+            ServerReuseState.RecordStarted();
+        }
+
+        #endregion
+
+        #region Reuse Status Formatting Tests (MCPL-013)
+
+        [Test]
+        public void FormatReuseSuffix_WithVersionNoMismatch_OmitsRestartHint()
+        {
+            // Act
+            string suffix = McpAdvancedSection.FormatReuseSuffix(
+                "2026-06-12T10:00:00.0000000Z", "4.2.1", versionMismatch: false);
+
+            // Assert
+            Assert.That(suffix, Does.StartWith("reused — started "));
+            Assert.That(suffix, Does.Contain("version 4.2.1"));
+            Assert.That(suffix, Does.Not.Contain("restart server"));
+        }
+
+        [Test]
+        public void FormatReuseSuffix_WithMismatch_IncludesRestartHint()
+        {
+            // Act
+            string suffix = McpAdvancedSection.FormatReuseSuffix(
+                "2026-06-12T10:00:00.0000000Z", "4.1.0", versionMismatch: true);
+
+            // Assert
+            Assert.That(suffix, Does.Contain("version 4.1.0"));
+            Assert.That(suffix, Does.Contain("restart server to update"));
+        }
+
+        [Test]
+        public void FormatReuseSuffix_MissingVersion_ReportsUnknownVersion()
+        {
+            // Act
+            string suffix = McpAdvancedSection.FormatReuseSuffix(
+                "2026-06-12T10:00:00.0000000Z", string.Empty, versionMismatch: false);
+
+            // Assert
+            Assert.That(suffix, Does.Contain("version unknown"));
+        }
+
+        [Test]
+        public void FormatReuseSuffix_UnparseableTime_ReportsUnknownTime()
+        {
+            // Act
+            string suffix = McpAdvancedSection.FormatReuseSuffix(
+                "not-a-timestamp", "4.2.1", versionMismatch: false);
+
+            // Assert
+            Assert.That(suffix, Does.Contain("started unknown time"));
         }
 
         #endregion

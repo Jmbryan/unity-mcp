@@ -709,5 +709,215 @@ namespace MCPForUnityTests.Editor.Services.Characterization
         }
 
         #endregion
+
+        #region Stop Server On Editor Quit Gating Tests (MCPL-002/003)
+
+        [Test]
+        public void ShouldStopServerOnQuit_PrefUnset_ReturnsFalse()
+        {
+            // Arrange — default is OFF: server survives graceful quit.
+            EditorPrefs.DeleteKey(EditorPrefKeys.StopServerOnEditorQuit);
+
+            // Act
+            bool result = McpEditorShutdownCleanup.ShouldStopServerOnQuit();
+
+            // Assert
+            Assert.IsFalse(result, "With the toggle unset, graceful quit must NOT stop the server (default OFF).");
+        }
+
+        [Test]
+        public void ShouldStopServerOnQuit_PrefOff_ReturnsFalse()
+        {
+            // Arrange
+            bool saved = EditorPrefs.GetBool(EditorPrefKeys.StopServerOnEditorQuit, false);
+            try
+            {
+                EditorPrefs.SetBool(EditorPrefKeys.StopServerOnEditorQuit, false);
+
+                // Act
+                bool result = McpEditorShutdownCleanup.ShouldStopServerOnQuit();
+
+                // Assert
+                Assert.IsFalse(result, "Toggle OFF: server-stop step must be skipped on quit.");
+            }
+            finally
+            {
+                EditorPrefs.SetBool(EditorPrefKeys.StopServerOnEditorQuit, saved);
+            }
+        }
+
+        [Test]
+        public void ShouldStopServerOnQuit_PrefOn_ReturnsTrue()
+        {
+            // Arrange
+            bool saved = EditorPrefs.GetBool(EditorPrefKeys.StopServerOnEditorQuit, false);
+            try
+            {
+                EditorPrefs.SetBool(EditorPrefKeys.StopServerOnEditorQuit, true);
+
+                // Act
+                bool result = McpEditorShutdownCleanup.ShouldStopServerOnQuit();
+
+                // Assert
+                Assert.IsTrue(result, "Toggle ON: server-stop step runs on quit (legacy behavior).");
+            }
+            finally
+            {
+                EditorPrefs.SetBool(EditorPrefKeys.StopServerOnEditorQuit, saved);
+            }
+        }
+
+        #endregion
+
+        #region ServerHealthCheck Version-Compare Tests (MCPL-010/011)
+
+        [Test]
+        public void CompareHealthVersion_MatchingVersions_ReturnsMatch()
+        {
+            // Arrange
+            string json = "{\"status\":\"healthy\",\"version\":\"4.2.1\",\"message\":\"ok\"}";
+
+            // Act
+            var result = ServerHealthCheck.CompareHealthVersion(json, "4.2.1", out string serverVersion);
+
+            // Assert
+            Assert.AreEqual(ServerVersionCheckResult.Match, result);
+            Assert.AreEqual("4.2.1", serverVersion);
+        }
+
+        [Test]
+        public void CompareHealthVersion_MatchingVersions_IgnoresWhitespaceAndCase()
+        {
+            // Arrange
+            string json = "{\"status\":\"healthy\",\"version\":\" 4.2.1-Beta.3 \"}";
+
+            // Act
+            var result = ServerHealthCheck.CompareHealthVersion(json, "4.2.1-beta.3", out string serverVersion);
+
+            // Assert
+            Assert.AreEqual(ServerVersionCheckResult.Match, result);
+            Assert.AreEqual(" 4.2.1-Beta.3 ", serverVersion);
+        }
+
+        [Test]
+        public void CompareHealthVersion_DifferentVersions_ReturnsMismatch()
+        {
+            // Arrange
+            string json = "{\"status\":\"healthy\",\"version\":\"4.1.0\"}";
+
+            // Act
+            var result = ServerHealthCheck.CompareHealthVersion(json, "4.2.1", out string serverVersion);
+
+            // Assert
+            Assert.AreEqual(ServerVersionCheckResult.Mismatch, result);
+            Assert.AreEqual("4.1.0", serverVersion);
+        }
+
+        [Test]
+        public void CompareHealthVersion_BridgeVersionUnknown_ReturnsBridgeVersionUnknown()
+        {
+            // Arrange
+            string json = "{\"status\":\"healthy\",\"version\":\"4.2.1\"}";
+
+            // Act
+            var result = ServerHealthCheck.CompareHealthVersion(json, "unknown", out string serverVersion);
+
+            // Assert
+            Assert.AreEqual(ServerVersionCheckResult.BridgeVersionUnknown, result);
+            Assert.AreEqual("4.2.1", serverVersion);
+        }
+
+        [Test]
+        public void CompareHealthVersion_BridgeVersionEmpty_ReturnsBridgeVersionUnknown()
+        {
+            // Arrange
+            string json = "{\"status\":\"healthy\",\"version\":\"4.2.1\"}";
+
+            // Act
+            var result = ServerHealthCheck.CompareHealthVersion(json, string.Empty, out _);
+
+            // Assert
+            Assert.AreEqual(ServerVersionCheckResult.BridgeVersionUnknown, result);
+        }
+
+        [Test]
+        public void CompareHealthVersion_ServerVersionUnknown_ReturnsMismatch()
+        {
+            // Arrange — server reports literal "unknown": we cannot vouch for it.
+            string json = "{\"status\":\"healthy\",\"version\":\"unknown\"}";
+
+            // Act
+            var result = ServerHealthCheck.CompareHealthVersion(json, "4.2.1", out string serverVersion);
+
+            // Assert
+            Assert.AreEqual(ServerVersionCheckResult.Mismatch, result);
+            Assert.AreEqual("unknown", serverVersion);
+        }
+
+        [Test]
+        public void CompareHealthVersion_MalformedJson_ReturnsUnparseable()
+        {
+            // Arrange
+            string json = "this is not json";
+
+            // Act
+            var result = ServerHealthCheck.CompareHealthVersion(json, "4.2.1", out string serverVersion);
+
+            // Assert — a non-MCP listener squatting on the port (MCPL-011).
+            Assert.AreEqual(ServerVersionCheckResult.Unparseable, result);
+            Assert.IsNull(serverVersion);
+        }
+
+        [Test]
+        public void CompareHealthVersion_EmptyBody_ReturnsUnparseable()
+        {
+            // Act
+            var result = ServerHealthCheck.CompareHealthVersion(string.Empty, "4.2.1", out _);
+
+            // Assert
+            Assert.AreEqual(ServerVersionCheckResult.Unparseable, result);
+        }
+
+        [Test]
+        public void CompareHealthVersion_JsonMissingVersionField_ReturnsUnparseable()
+        {
+            // Arrange — valid JSON, but not the MCP health shape (no version field).
+            string json = "{\"status\":\"healthy\",\"hello\":\"world\"}";
+
+            // Act
+            var result = ServerHealthCheck.CompareHealthVersion(json, "4.2.1", out _);
+
+            // Assert
+            Assert.AreEqual(ServerVersionCheckResult.Unparseable, result);
+        }
+
+        [Test]
+        public void CompareHealthVersion_JsonMissingStatusField_ReturnsUnparseable()
+        {
+            // Arrange — has version but no status: not our health endpoint.
+            string json = "{\"version\":\"4.2.1\"}";
+
+            // Act
+            var result = ServerHealthCheck.CompareHealthVersion(json, "4.2.1", out _);
+
+            // Assert
+            Assert.AreEqual(ServerVersionCheckResult.Unparseable, result);
+        }
+
+        [Test]
+        public void TryParseHealthVersion_ValidHealth_ReturnsTrueWithVersion()
+        {
+            // Arrange
+            string json = "{\"status\":\"healthy\",\"version\":\"4.2.1\",\"timestamp\":1234.5}";
+
+            // Act
+            bool ok = ServerHealthCheck.TryParseHealthVersion(json, out string version);
+
+            // Assert
+            Assert.IsTrue(ok);
+            Assert.AreEqual("4.2.1", version);
+        }
+
+        #endregion
     }
 }
