@@ -41,6 +41,15 @@ namespace MCPForUnity.Editor.Services
             }
 
             // 2) Stop local HTTP server if it was Unity-managed (best-effort).
+            // Gated behind the "Stop Server on Editor Quit" toggle (default OFF): when the toggle is
+            // off the server process is deliberately left running so live agent sessions survive a
+            // graceful editor restart. The transport goodbye above is unconditional in both states.
+            if (!ShouldStopServerOnQuit())
+            {
+                McpLog.Info("Shutdown cleanup: leaving local HTTP server running (Stop Server on Editor Quit is off).");
+                return;
+            }
+
             try
             {
                 bool useHttp = EditorConfigurationCache.Instance.UseHttpTransport;
@@ -70,6 +79,23 @@ namespace MCPForUnity.Editor.Services
             catch (Exception ex)
             {
                 McpLog.Warn($"Shutdown cleanup: failed to stop local HTTP server: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Whether graceful quit should stop the local HTTP server. Reads the "Stop Server on
+        /// Editor Quit" toggle (default OFF). Pure decision so it is unit-testable independently
+        /// of the editor-quit lifecycle.
+        /// </summary>
+        internal static bool ShouldStopServerOnQuit()
+        {
+            try
+            {
+                return EditorPrefs.GetBool(EditorPrefKeys.StopServerOnEditorQuit, false);
+            }
+            catch
+            {
+                return false;
             }
         }
     }

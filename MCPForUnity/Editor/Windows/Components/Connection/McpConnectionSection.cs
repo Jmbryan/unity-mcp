@@ -33,6 +33,8 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
         private Label transportMismatchText;
         private VisualElement versionMismatchWarning;
         private Label versionMismatchText;
+        private VisualElement serverVersionMismatchWarning;
+        private Label serverVersionMismatchText;
         private VisualElement httpUrlRow;
         private VisualElement httpServerControlRow;
         private Foldout manualCommandFoldout;
@@ -91,6 +93,8 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
             transportMismatchText = Root.Q<Label>("transport-mismatch-text");
             versionMismatchWarning = Root.Q<VisualElement>("version-mismatch-warning");
             versionMismatchText = Root.Q<Label>("version-mismatch-text");
+            serverVersionMismatchWarning = Root.Q<VisualElement>("server-version-mismatch-warning");
+            serverVersionMismatchText = Root.Q<Label>("server-version-mismatch-text");
             httpUrlRow = Root.Q<VisualElement>("http-url-row");
             httpServerControlRow = Root.Q<VisualElement>("http-server-control-row");
             manualCommandFoldout = Root.Q<Foldout>("manual-command-foldout");
@@ -1129,6 +1133,33 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
         public void ClearVersionMismatchWarning()
         {
             versionMismatchWarning?.RemoveFromClassList("visible");
+        }
+
+        /// <summary>
+        /// Surfaces the reuse-time server/bridge version mismatch (MCPL-010). The "Start Server"
+        /// control doubles as the one-click Restart Server action: stopping then starting the local
+        /// server rebuilds the launch command, which honors DevModeForceServerRefresh so an updated
+        /// fork build is actually fetched.
+        /// </summary>
+        public void RefreshServerVersionMismatchWarning()
+        {
+            if (serverVersionMismatchWarning == null || serverVersionMismatchText == null)
+                return;
+
+            if (!ServerReuseState.ReusedExistingServer || !ServerReuseState.HasVersionMismatch)
+            {
+                serverVersionMismatchWarning.RemoveFromClassList("visible");
+                return;
+            }
+
+            string serverVersion = string.IsNullOrEmpty(ServerReuseState.ReusedServerVersion)
+                ? "unknown"
+                : ServerReuseState.ReusedServerVersion;
+            string bridgeVersion = AssetPathUtility.GetPackageVersion();
+
+            serverVersionMismatchText.text = $"⚠ Server version {serverVersion} ≠ bridge version {bridgeVersion} — " +
+                "click \"Start Server\" above to restart and update.";
+            serverVersionMismatchWarning.AddToClassList("visible");
         }
 
         private static string TransportDisplayName(ConfiguredTransport transport)

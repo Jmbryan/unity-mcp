@@ -595,6 +595,7 @@ namespace MCPForUnity.Editor.Windows
             }
 
             advancedSection?.UpdatePathOverrides();
+            connectionSection?.RefreshServerVersionMismatchWarning();
             clientConfigSection?.RefreshSelectedClient();
         }
 

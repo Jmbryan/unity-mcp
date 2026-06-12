@@ -80,8 +80,16 @@ namespace MCPForUnity.Editor.Services
                         return;
                     }
 
-                    // Check if server is already reachable (e.g. user started it externally).
-                    if (!MCPServiceLocator.Server.IsLocalHttpServerReachable())
+                    // Check if server is already reachable (e.g. it survived a graceful quit, or the
+                    // user started it externally). Reuse is the intended path on editor restart.
+                    // This fact is only knowable here, before we (possibly) launch one ourselves (MCPL-013).
+                    bool reusedExistingServer = MCPServiceLocator.Server.IsLocalHttpServerReachable();
+                    if (reusedExistingServer)
+                    {
+                        // We did not launch this server: query /health and compare versions (MCPL-010/011).
+                        await PerformReuseVersionCheckAsync();
+                    }
+                    else
                     {
                         bool serverStarted = MCPServiceLocator.Server.StartLocalHttpServer(quiet: true);
                         if (!serverStarted)
@@ -89,6 +97,7 @@ namespace MCPForUnity.Editor.Services
                             McpLog.Warn("[HTTP Auto-Start] Failed to start local HTTP server");
                             return;
                         }
+                        ServerReuseState.RecordStarted();
                     }
 
                     // Wait for the server to become reachable, then connect.
@@ -103,6 +112,80 @@ namespace MCPForUnity.Editor.Services
             catch (Exception ex)
             {
                 McpLog.Warn($"[HTTP Auto-Start] Failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Queries the reused server's /health endpoint and compares its reported version against
+        /// this bridge's package version. Warn-only — never kills the server (MCPL-010/011). Records
+        /// the reuse fact + version into SessionState for the window/toolbar to surface (MCPL-013).
+        /// </summary>
+        private static async Task PerformReuseVersionCheckAsync()
+        {
+            string bridgeVersion = AssetPathUtility.GetPackageVersion();
+            string nowIso = DateTime.UtcNow.ToString("o");
+
+            string healthJson = await FetchHealthAsync();
+            if (healthJson == null)
+            {
+                // Reachable on the TCP probe but /health did not respond: treat as an unknown listener.
+                McpLog.Warn("[HTTP Auto-Start] Reused a reachable local server but its /health endpoint did not respond — treating as an unknown listener.");
+                ServerReuseState.RecordReused(string.Empty, nowIso, versionMismatch: true);
+                return;
+            }
+
+            var result = ServerHealthCheck.CompareHealthVersion(healthJson, bridgeVersion, out string serverVersion);
+            switch (result)
+            {
+                case ServerVersionCheckResult.Match:
+                    McpLog.Info($"[HTTP Auto-Start] Reused running local server (version {serverVersion}).");
+                    ServerReuseState.RecordReused(serverVersion, nowIso, versionMismatch: false);
+                    break;
+                case ServerVersionCheckResult.BridgeVersionUnknown:
+                    McpLog.Warn("[HTTP Auto-Start] Reused running local server but bridge package version is unknown — skipping version check.");
+                    ServerReuseState.RecordReused(serverVersion, nowIso, versionMismatch: false);
+                    break;
+                case ServerVersionCheckResult.Unparseable:
+                    McpLog.Warn("[HTTP Auto-Start] A process is listening on the local server port but its /health response is not recognizable as an MCP-for-Unity server (unknown listener).");
+                    ServerReuseState.RecordReused(string.Empty, nowIso, versionMismatch: true);
+                    break;
+                default: // Mismatch
+                    McpLog.Warn($"[HTTP Auto-Start] Reused running local server version {serverVersion} != bridge version {bridgeVersion} — restart server to update.");
+                    ServerReuseState.RecordReused(serverVersion, nowIso, versionMismatch: true);
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Performs a bounded HTTP GET against the local server's /health endpoint.
+        /// Returns the raw response body, or null on any failure (timeout, refused, non-success).
+        /// </summary>
+        private static async Task<string> FetchHealthAsync()
+        {
+            try
+            {
+                string baseUrl = HttpEndpointUtility.GetLocalBaseUrl();
+                if (string.IsNullOrEmpty(baseUrl))
+                {
+                    return null;
+                }
+
+                string healthEndpoint = $"{baseUrl.TrimEnd('/')}/health";
+                using (var client = new System.Net.Http.HttpClient())
+                {
+                    client.Timeout = TimeSpan.FromSeconds(3);
+                    var response = await client.GetAsync(healthEndpoint);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        return null;
+                    }
+                    return await response.Content.ReadAsStringAsync();
+                }
+            }
+            catch (Exception ex)
+            {
+                McpLog.Debug($"[HTTP Auto-Start] /health query failed: {ex.Message}");
+                return null;
             }
         }
 

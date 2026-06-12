@@ -25,6 +25,7 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
         private Button browseGitUrlButton;
         private Button clearGitUrlButton;
         private Toggle autoStartOnLoadToggle;
+        private Toggle stopServerOnQuitToggle;
         private Toggle debugLogsToggle;
         private Toggle logRecordToggle;
         private Toggle devModeForceRefreshToggle;
@@ -71,6 +72,7 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             browseGitUrlButton = Root.Q<Button>("browse-git-url-button");
             clearGitUrlButton = Root.Q<Button>("clear-git-url-button");
             autoStartOnLoadToggle = Root.Q<Toggle>("auto-start-on-load-toggle");
+            stopServerOnQuitToggle = Root.Q<Toggle>("stop-server-on-quit-toggle");
             debugLogsToggle = Root.Q<Toggle>("debug-logs-toggle");
             logRecordToggle = Root.Q<Toggle>("log-record-toggle");
             devModeForceRefreshToggle = Root.Q<Toggle>("dev-mode-force-refresh-toggle");
@@ -177,6 +179,17 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
                 autoStartOnLoadToggle.SetValueWithoutNotify(EditorPrefs.GetBool(EditorPrefKeys.AutoStartOnLoad, false));
             }
 
+            if (stopServerOnQuitToggle != null)
+            {
+                stopServerOnQuitToggle.tooltip = "When enabled, gracefully quitting the Unity Editor also stops the local MCP server process. " +
+                    "Disabled by default so the server keeps running across editor restarts and live agent sessions survive. " +
+                    "Only applies to HTTP Local transport.";
+                var stopServerLabel = stopServerOnQuitToggle.parent?.Q<Label>();
+                if (stopServerLabel != null)
+                    stopServerLabel.tooltip = stopServerOnQuitToggle.tooltip;
+                stopServerOnQuitToggle.SetValueWithoutNotify(EditorPrefs.GetBool(EditorPrefKeys.StopServerOnEditorQuit, false));
+            }
+
             gitUrlOverride.value = EditorPrefs.GetString(EditorPrefKeys.GitUrlOverride, "");
 
             bool debugEnabled = EditorPrefs.GetBool(EditorPrefKeys.DebugLogs, false);
@@ -252,6 +265,14 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
                 autoStartOnLoadToggle.RegisterValueChangedCallback(evt =>
                 {
                     EditorPrefs.SetBool(EditorPrefKeys.AutoStartOnLoad, evt.newValue);
+                });
+            }
+
+            if (stopServerOnQuitToggle != null)
+            {
+                stopServerOnQuitToggle.RegisterValueChangedCallback(evt =>
+                {
+                    EditorPrefs.SetBool(EditorPrefKeys.StopServerOnEditorQuit, evt.newValue);
                 });
             }
 
@@ -401,6 +422,8 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             gitUrlOverride.value = EditorPrefs.GetString(EditorPrefKeys.GitUrlOverride, "");
             if (autoStartOnLoadToggle != null)
                 autoStartOnLoadToggle.value = EditorPrefs.GetBool(EditorPrefKeys.AutoStartOnLoad, false);
+            if (stopServerOnQuitToggle != null)
+                stopServerOnQuitToggle.SetValueWithoutNotify(EditorPrefs.GetBool(EditorPrefKeys.StopServerOnEditorQuit, false));
             debugLogsToggle.value = EditorPrefs.GetBool(EditorPrefKeys.DebugLogs, false);
             if (logRecordToggle != null)
                 logRecordToggle.value = McpLogRecord.IsEnabled;
@@ -653,7 +676,7 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
         {
             if (healthStatus != null)
             {
-                healthStatus.text = statusText;
+                healthStatus.text = AppendServerReuseSuffix(statusText);
             }
 
             if (healthIndicator != null)
@@ -675,6 +698,50 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
                     healthIndicator.AddToClassList("disconnected");
                 }
             }
+        }
+
+        /// <summary>
+        /// When this editor reused an already-running server (rather than starting one), append a
+        /// "reused — started &lt;time&gt;, version X" suffix so the long-lived-server state is legible (MCPL-013).
+        /// </summary>
+        private static string AppendServerReuseSuffix(string statusText)
+        {
+            if (!ServerReuseState.ReusedExistingServer)
+            {
+                return statusText;
+            }
+
+            string suffix = FormatReuseSuffix(
+                ServerReuseState.ReusedServerStartedAtIso,
+                ServerReuseState.ReusedServerVersion,
+                ServerReuseState.HasVersionMismatch);
+
+            return string.IsNullOrEmpty(suffix) ? statusText : $"{statusText} ({suffix})";
+        }
+
+        /// <summary>
+        /// Builds the parenthetical reuse descriptor. Pure logic for testability.
+        /// </summary>
+        internal static string FormatReuseSuffix(string startedAtIso, string version, bool versionMismatch)
+        {
+            string timePart = "started unknown time";
+            if (!string.IsNullOrEmpty(startedAtIso)
+                && DateTime.TryParse(startedAtIso, null,
+                    System.Globalization.DateTimeStyles.RoundtripKind, out DateTime started))
+            {
+                timePart = $"started {started.ToLocalTime():t}";
+            }
+
+            string versionPart = string.IsNullOrEmpty(version)
+                ? "version unknown"
+                : $"version {version}";
+
+            string suffix = $"reused — {timePart}, {versionPart}";
+            if (versionMismatch)
+            {
+                suffix += " ⚠ restart server to update";
+            }
+            return suffix;
         }
     }
 }
