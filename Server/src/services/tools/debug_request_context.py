@@ -50,11 +50,13 @@ async def debug_request_context(ctx: Context) -> dict[str, Any]:
     middleware = get_unity_instance_middleware()
     derived_key = await middleware.get_session_key(ctx)
     active_instance = await middleware.get_active_instance(ctx)
+    identity = await middleware.get_session_identity(ctx)
 
     # Debugging middleware internals
     # NOTE: These fields expose internal implementation details and may change between versions.
     with middleware._lock:
         all_keys = list(middleware._active_by_key.keys())
+        all_identity_keys = list(middleware._identity_by_key.keys())
 
     # Debugging PluginHub state
     plugin_hub_configured = PluginHub.is_configured()
@@ -79,7 +81,12 @@ async def debug_request_context(ctx: Context) -> dict[str, Any]:
             "session_state": {
                 "derived_key": derived_key,
                 "active_instance": active_instance,
+                "agent_label": identity.label,
+                "session_name": identity.name,
+                "session_color": identity.color,
+                "display_name": identity.display_name,
                 "all_keys_in_store": all_keys,
+                "all_identity_keys": all_identity_keys,
                 "plugin_hub_configured": plugin_hub_configured,
                 "middleware_id": id(middleware),
             },

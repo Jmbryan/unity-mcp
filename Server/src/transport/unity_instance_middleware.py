@@ -4,6 +4,7 @@ Middleware for managing Unity instance selection per session.
 This middleware intercepts all tool calls and injects the active Unity instance
 into the request-scoped state, allowing tools to access it via ctx.get_state("unity_instance").
 """
+from dataclasses import dataclass
 from threading import RLock
 import logging
 import time
@@ -11,6 +12,7 @@ import time
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 from core.config import config
+from core.constants import AGENT_LABEL_HEADER
 from services.registry import get_registered_tools
 from transport.plugin_hub import PluginHub
 
@@ -47,6 +49,41 @@ def set_unity_instance_middleware(middleware: 'UnityInstanceMiddleware') -> None
     _unity_instance_middleware = middleware
 
 
+# Pools for auto-assigned per-session identity. Names cycle with a numeric
+# suffix once exhausted; colors simply cycle.
+_FRIENDLY_NAMES: tuple[str, ...] = (
+    "Aurora", "Basalt", "Cobalt", "Dune", "Ember", "Fjord", "Garnet",
+    "Harbor", "Indigo", "Juniper", "Kestrel", "Lumen", "Maple", "Nimbus",
+    "Onyx", "Pumice", "Quartz", "Rowan", "Sable", "Tundra", "Umber",
+    "Vesper", "Willow", "Xenon", "Yarrow", "Zephyr",
+)
+_IDENTITY_COLORS: tuple[str, ...] = (
+    "#E06C75", "#61AFEF", "#98C379", "#E5C07B",
+    "#C678DD", "#56B6C2", "#D19A66", "#7F9F7F",
+)
+
+
+@dataclass
+class SessionIdentity:
+    """Sticky identity for one MCP session.
+
+    Assigned on first sight of a session key and held for the server process
+    lifetime (state intentionally dies with the process — fail-open). The
+    optional ``label`` is the human-meaningful agent label supplied via the
+    ``X-Agent-Label`` header; labeled sessions display it, unlabeled sessions
+    fall back to the auto-assigned friendly name.
+    """
+
+    key: str
+    name: str
+    color: str
+    label: str | None = None
+
+    @property
+    def display_name(self) -> str:
+        return self.label or self.name
+
+
 class UnityInstanceMiddleware(Middleware):
     """
     Middleware that manages per-session Unity instance selection.
@@ -58,6 +95,10 @@ class UnityInstanceMiddleware(Middleware):
     def __init__(self):
         super().__init__()
         self._active_by_key: dict[str, str] = {}
+        # Sticky per-session identity (name/color/label), keyed like
+        # _active_by_key. Never evicted: lives for the server process lifetime.
+        self._identity_by_key: dict[str, SessionIdentity] = {}
+        self._identity_counter = 0
         self._lock = RLock()
         self._metadata_lock = RLock()
         self._unity_managed_tool_names: set[str] = set()
@@ -72,10 +113,24 @@ class UnityInstanceMiddleware(Middleware):
         """
         Derive a stable key for the calling session.
 
-        Prioritizes client_id for stability.
-        In remote-hosted mode, falls back to user_id for session isolation.
-        Otherwise falls back to 'global' (assuming single-user local mode).
+        Prefers the direct ``ctx.session_id`` property: over streamable HTTP
+        it is the only populated identity — unique per client session — while
+        ``ctx.request_context.session_id`` and ``client_id`` are None. All
+        per-session state must key through this method so concurrent agent
+        sessions never collapse onto a shared key.
+
+        Order: session_id, then client_id, then user_id (remote-hosted
+        isolation). The literal 'global' fallback is reserved for stdio,
+        where a single client owns the process.
         """
+        try:
+            session_id = getattr(ctx, "session_id", None)
+        except Exception:
+            # fastmcp raises RuntimeError outside a request context.
+            session_id = None
+        if isinstance(session_id, str) and session_id:
+            return session_id
+
         client_id = getattr(ctx, "client_id", None)
         if isinstance(client_id, str) and client_id:
             return client_id
@@ -85,8 +140,18 @@ class UnityInstanceMiddleware(Middleware):
         if isinstance(user_id, str) and user_id:
             return f"user:{user_id}"
 
-        # Fallback to global for local dev stability
-        return "global"
+        transport = (config.transport_mode or "stdio").lower()
+        if transport != "http":
+            # stdio: one client per process, a shared key is correct.
+            return "global"
+
+        # An HTTP session with no identity should not occur (streamable HTTP
+        # always carries a session id). Keep such sessions isolated from the
+        # stdio 'global' key rather than silently sharing state with it.
+        logger.warning(
+            "HTTP session presented no session identity; keying state as 'http-unkeyed'"
+        )
+        return "http-unkeyed"
 
     async def set_active_instance(self, ctx, instance_id: str) -> None:
         """Store the active instance for this session."""
@@ -106,6 +171,66 @@ class UnityInstanceMiddleware(Middleware):
         with self._lock:
             self._active_by_key.pop(key, None)
 
+    def ensure_session_identity_for_key(self, key: str) -> SessionIdentity:
+        """Return the sticky identity for a session key, assigning one on first sight."""
+        with self._lock:
+            identity = self._identity_by_key.get(key)
+            if identity is None:
+                index = self._identity_counter
+                self._identity_counter += 1
+                name = _FRIENDLY_NAMES[index % len(_FRIENDLY_NAMES)]
+                cycle = index // len(_FRIENDLY_NAMES)
+                if cycle:
+                    name = f"{name}-{cycle + 1}"
+                color = _IDENTITY_COLORS[index % len(_IDENTITY_COLORS)]
+                identity = SessionIdentity(key=key, name=name, color=color)
+                self._identity_by_key[key] = identity
+                logger.info("Assigned session identity '%s' (%s) to key %s",
+                            name, color, key)
+            return identity
+
+    async def get_session_identity(self, ctx) -> SessionIdentity:
+        """Return the sticky identity for the calling session."""
+        key = await self.get_session_key(ctx)
+        return self.ensure_session_identity_for_key(key)
+
+    @staticmethod
+    def _read_agent_label_header() -> str | None:
+        """Read the agent label from the current HTTP request, if any.
+
+        Returns None for stdio transport, requests without the header, or
+        empty/whitespace header values.
+        """
+        try:
+            from fastmcp.server.dependencies import get_http_headers
+            headers = get_http_headers(include_all=True)
+        except Exception:
+            return None
+        raw = headers.get(AGENT_LABEL_HEADER.lower())
+        if isinstance(raw, str):
+            raw = raw.strip()
+            if raw:
+                return raw
+        return None
+
+    async def _capture_agent_label(self, ctx) -> None:
+        """Ensure the session has a sticky identity and cache its agent label.
+
+        The label is cached per session key on first sight; later requests
+        (with or without the header) never change it.
+        """
+        identity = await self.get_session_identity(ctx)
+        if identity.label is not None:
+            return
+        label = self._read_agent_label_header()
+        if not label:
+            return
+        with self._lock:
+            if identity.label is None:
+                identity.label = label
+                logger.info("Session %s (%s) labeled '%s'",
+                            identity.key, identity.name, label)
+
     async def _discover_instances(self, ctx) -> list:
         """
         Return running Unity instances across both HTTP (PluginHub) and stdio transports.
@@ -124,10 +249,16 @@ class UnityInstanceMiddleware(Middleware):
                     user_id = await get_state_fn("user_id")
                 sessions_data = await PluginHub.get_sessions(user_id=user_id)
                 sessions = sessions_data.sessions or {}
+                # Instance identity is the registered project identity
+                # (project_hash) — never the per-registration session id,
+                # which is a random per-launch GUID. Dedupe by hash so a
+                # reconnect race never presents one project as two instances.
+                seen_hashes: set[str] = set()
                 for session_info in sessions.values():
                     project = getattr(session_info, "project", None) or "Unknown"
                     hash_value = getattr(session_info, "hash", None)
-                    if hash_value:
+                    if hash_value and hash_value not in seen_hashes:
+                        seen_hashes.add(hash_value)
                         results.append(SimpleNamespace(
                             id=f"{project}@{hash_value}",
                             hash=hash_value,
@@ -226,7 +357,14 @@ class UnityInstanceMiddleware(Middleware):
 
     async def _maybe_autoselect_instance(self, ctx) -> str | None:
         """
-        Auto-select the sole Unity instance when no active instance is set.
+        Auto-select the primary Unity instance when no active instance is set.
+
+        The primary instance is derived from registered project identity (the
+        project_hash the bridge sends at registration) — never from the
+        per-registration session GUID, which changes on every reconnect.
+        A session with no explicit pin routes to the sole registered project;
+        with multiple distinct projects there is no primary and the caller
+        must select explicitly.
 
         Note: This method both *discovers* and *persists* the selection via
         `set_active_instance` as a side-effect, since callers expect the selection
@@ -241,13 +379,17 @@ class UnityInstanceMiddleware(Middleware):
                 try:
                     sessions_data = await PluginHub.get_sessions()
                     sessions = sessions_data.sessions or {}
-                    ids: list[str] = []
+                    # Key by project_hash so duplicate registrations for the
+                    # same project (e.g. a domain-reload reconnect race) still
+                    # resolve to one primary instance.
+                    ids_by_hash: dict[str, str] = {}
                     for session_info in sessions.values():
                         project = getattr(
                             session_info, "project", None) or "Unknown"
                         hash_value = getattr(session_info, "hash", None)
-                        if hash_value:
-                            ids.append(f"{project}@{hash_value}")
+                        if hash_value and hash_value not in ids_by_hash:
+                            ids_by_hash[hash_value] = f"{project}@{hash_value}"
+                    ids = list(ids_by_hash.values())
                     if len(ids) == 1:
                         chosen = ids[0]
                         await self.set_active_instance(ctx, chosen)
@@ -345,6 +487,10 @@ class UnityInstanceMiddleware(Middleware):
             )
         if user_id:
             await ctx.set_state("user_id", user_id)
+
+        # Ensure the session has a sticky identity and cache its optional
+        # X-Agent-Label header on first sight.
+        await self._capture_agent_label(ctx)
 
         # Per-call routing: check if this tool call explicitly specifies unity_instance.
         # context.message.arguments is a mutable dict on CallToolRequestParams; resource

@@ -69,13 +69,14 @@ class TestMiddlewareAuthEnforcement:
 class TestMiddlewareSessionKey:
     @pytest.mark.asyncio
     async def test_get_session_key_uses_user_id_fallback(self):
-        """When no client_id, middleware should use user:$user_id as session key."""
+        """When no session_id/client_id, middleware should use user:$user_id as session key."""
         from transport.unity_instance_middleware import UnityInstanceMiddleware
 
         middleware = UnityInstanceMiddleware()
 
         ctx = DummyContext()
-        # Simulate no client_id attribute
+        # Simulate no session/client identity
+        ctx.session_id = None
         if hasattr(ctx, "client_id"):
             delattr(ctx, "client_id")
         await ctx.set_state("user_id", "user-77")
@@ -84,18 +85,34 @@ class TestMiddlewareSessionKey:
         assert key == "user:user-77"
 
     @pytest.mark.asyncio
-    async def test_get_session_key_prefers_client_id(self):
-        """client_id should take precedence over user_id."""
+    async def test_get_session_key_prefers_client_id_over_user_id(self):
+        """Without a session_id, client_id should take precedence over user_id."""
         from transport.unity_instance_middleware import UnityInstanceMiddleware
 
         middleware = UnityInstanceMiddleware()
 
         ctx = DummyContext()
+        ctx.session_id = None
         ctx.client_id = "client-abc"
         await ctx.set_state("user_id", "user-77")
 
         key = await middleware.get_session_key(ctx)
         assert key == "client-abc"
+
+    @pytest.mark.asyncio
+    async def test_get_session_key_prefers_session_id(self):
+        """The direct ctx.session_id property wins over client_id and user_id."""
+        from transport.unity_instance_middleware import UnityInstanceMiddleware
+
+        middleware = UnityInstanceMiddleware()
+
+        ctx = DummyContext()
+        ctx.session_id = "mcp-session-1"
+        ctx.client_id = "client-abc"
+        await ctx.set_state("user_id", "user-77")
+
+        key = await middleware.get_session_key(ctx)
+        assert key == "mcp-session-1"
 
 
 class TestAutoSelectDisabledRemoteHosted:
