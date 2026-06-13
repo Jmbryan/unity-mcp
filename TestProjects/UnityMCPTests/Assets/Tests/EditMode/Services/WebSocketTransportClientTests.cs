@@ -121,6 +121,103 @@ namespace MCPForUnityTests.Editor.Services
         }
 
         [Test]
+        public void BuildEventPayload_ProducesEventEnvelope_WithEventName()
+        {
+            // Act
+            JObject payload = InvokeBuildEventPayload("entered_play", "MyProject", "abc123def456");
+
+            // Assert — the wire shape the server intake expects.
+            Assert.AreEqual("event", payload.Value<string>("type"));
+            Assert.AreEqual("entered_play", payload.Value<string>("event"));
+            Assert.IsNotNull(payload["payload"], "payload object should always be present.");
+            Assert.IsInstanceOf<JObject>(payload["payload"]);
+        }
+
+        [Test]
+        public void BuildEventPayload_IncludesInstanceAndHash_WhenIdentityKnown()
+        {
+            // Act
+            JObject payload = InvokeBuildEventPayload("compile_finished", "MyProject", "abc123def456");
+
+            // Assert — instance is "<Name>@<hash>" and project_hash mirrors the hash.
+            Assert.AreEqual("abc123def456", payload.Value<string>("project_hash"));
+            Assert.AreEqual("MyProject@abc123def456", payload.Value<string>("instance"));
+        }
+
+        [Test]
+        public void BuildEventPayload_TimestampIsUnixSeconds_AsFloat()
+        {
+            // Arrange — bracket the call with unix-second bounds.
+            double before = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
+
+            // Act
+            JObject payload = InvokeBuildEventPayload("domain_reload_done", "MyProject", "hash");
+
+            double after = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
+
+            // Assert — ts is a JSON number in unix seconds within the bracketed window.
+            JToken ts = payload["ts"];
+            Assert.IsNotNull(ts);
+            Assert.AreEqual(JTokenType.Float, ts.Type, "ts should serialize as a float (unix seconds).");
+            double tsValue = ts.Value<double>();
+            Assert.GreaterOrEqual(tsValue, before);
+            Assert.LessOrEqual(tsValue, after);
+        }
+
+        [Test]
+        public void BuildEventPayload_OmitsIdentity_WhenHashMissing()
+        {
+            // Act — only event is required server-side; identity fields are optional.
+            JObject payload = InvokeBuildEventPayload("exited_play", "MyProject", null);
+
+            // Assert
+            Assert.AreEqual("exited_play", payload.Value<string>("event"));
+            Assert.IsNull(payload["project_hash"], "project_hash must be omitted when hash unknown.");
+            Assert.IsNull(payload["instance"], "instance must be omitted when hash unknown.");
+        }
+
+        [Test]
+        public void BuildEventPayload_OmitsInstance_WhenNameMissingButHashPresent()
+        {
+            // Act
+            JObject payload = InvokeBuildEventPayload("compile_started", null, "hashonly");
+
+            // Assert — hash alone is still useful for routing; instance requires both halves.
+            Assert.AreEqual("hashonly", payload.Value<string>("project_hash"));
+            Assert.IsNull(payload["instance"], "instance requires a project name to compose Name@hash.");
+        }
+
+        [Test]
+        public void StdioTransport_PushEventAsync_IsNoOp_DoesNotThrow()
+        {
+            // Arrange
+            var client = new StdioTransportClient();
+
+            // Act + Assert — stdio has no push channel; the no-op completes without throwing.
+            Assert.DoesNotThrow(() => client.PushEventAsync("entered_play").GetAwaiter().GetResult());
+        }
+
+        [Test]
+        public void StdioTransport_PushEventAsync_NullEventName_DoesNotThrow()
+        {
+            // Arrange
+            var client = new StdioTransportClient();
+
+            // Act + Assert
+            Assert.DoesNotThrow(() => client.PushEventAsync(null).GetAwaiter().GetResult());
+        }
+
+        private static JObject InvokeBuildEventPayload(string eventName, string projectName, string projectHash)
+        {
+            const BindingFlags flags = BindingFlags.NonPublic | BindingFlags.Static;
+            MethodInfo method = typeof(WebSocketTransportClient).GetMethod("BuildEventPayload", flags);
+            Assert.IsNotNull(method, "Expected private static BuildEventPayload(string, string, string) to exist.");
+            var result = method.Invoke(null, new object[] { eventName, projectName, projectHash });
+            Assert.IsInstanceOf<JObject>(result);
+            return (JObject)result;
+        }
+
+        [Test]
         public void SessionRoster_WellFormedMessage_PopulatesSnapshot()
         {
             // Arrange — a full envelope with one entry, a play lease, and a health block.

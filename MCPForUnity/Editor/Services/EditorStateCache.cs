@@ -1,9 +1,12 @@
 using System;
 using System.Reflection;
+using System.Threading.Tasks;
 using MCPForUnity.Editor.Helpers;
+using MCPForUnity.Editor.Services.Transport;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
+using UnityEditor.Compilation;
 using UnityEditorInternal;
 using UnityEditor.SceneManagement;
 using UnityEngine;
@@ -265,7 +268,10 @@ namespace MCPForUnity.Editor.Services
                 _cached = BuildSnapshot("init");
 
                 EditorApplication.update += OnUpdate;
-                EditorApplication.playModeStateChanged += _ => ForceUpdate("playmode");
+                EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
+
+                CompilationPipeline.compilationStarted += _ => EmitEditorEdgeEvent("compile_started");
+                CompilationPipeline.compilationFinished += _ => EmitEditorEdgeEvent("compile_finished");
 
                 AssemblyReloadEvents.beforeAssemblyReload += () =>
                 {
@@ -278,6 +284,7 @@ namespace MCPForUnity.Editor.Services
                     _domainReloadPending = false;
                     _domainReloadAfterUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                     ForceUpdate("after_domain_reload");
+                    EmitEditorEdgeEvent("domain_reload_done");
                 };
             }
             catch (Exception ex)
@@ -371,6 +378,57 @@ namespace MCPForUnity.Editor.Services
             lock (LockObj)
             {
                 _cached = BuildSnapshot(reason);
+            }
+        }
+
+        private static void OnPlayModeStateChanged(PlayModeStateChange change)
+        {
+            ForceUpdate("playmode");
+
+            // Map the two stable edges to the server's play events. EnteredPlayMode/EnteredEditMode
+            // (not the Exiting* edges) are the settled states the server keys gate releases off.
+            switch (change)
+            {
+                case PlayModeStateChange.EnteredPlayMode:
+                    EmitEditorEdgeEvent("entered_play");
+                    break;
+                case PlayModeStateChange.EnteredEditMode:
+                    EmitEditorEdgeEvent("exited_play");
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Pushes a lightweight editor-edge event to the server via the active transport so parked
+        /// gate calls can release event-driven. Strictly best-effort and fire-and-forget: any send
+        /// is bounded by a short timeout inside the transport and never blocks this callback — which
+        /// is critical because some edges fire on or adjacent to the domain-reload path.
+        /// </summary>
+        private static void EmitEditorEdgeEvent(string eventName)
+        {
+            try
+            {
+                IMcpTransportClient client = MCPServiceLocator.TransportManager.GetClient(TransportMode.Http);
+                if (client == null || !client.IsConnected)
+                {
+                    return;
+                }
+
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await client.PushEventAsync(eventName).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        McpLog.Debug($"[EditorStateCache] Event push '{eventName}' failed: {ex.Message}");
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                McpLog.Debug($"[EditorStateCache] Failed to emit edge event '{eventName}': {ex.Message}");
             }
         }
 

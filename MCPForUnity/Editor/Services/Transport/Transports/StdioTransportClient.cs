@@ -53,5 +53,12 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             return Task.CompletedTask;
         }
 
+        public Task PushEventAsync(string eventName)
+        {
+            // Stdio has no server-push channel; the legacy TCP bridge is request/response only.
+            // Parked gate calls fall back to their bounded poll, so a no-op here is safe.
+            return Task.CompletedTask;
+        }
+
     }
 }

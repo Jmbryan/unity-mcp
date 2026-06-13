@@ -614,6 +614,73 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             }
         }
 
+        /// <summary>
+        /// Maximum time a single event push is allowed to occupy. Deliberately short: the push is
+        /// best-effort and may run on or near the domain-reload path, where blocking is unacceptable.
+        /// </summary>
+        private static readonly TimeSpan EventPushTimeout = TimeSpan.FromSeconds(2);
+
+        /// <summary>
+        /// Builds the editor-edge event payload the server intake expects. Kept as a discrete static
+        /// helper so the wire shape ({ type:"event", event, instance, project_hash, ts, payload })
+        /// is unit-testable without a live socket.
+        /// </summary>
+        private static JObject BuildEventPayload(string eventName, string projectName, string projectHash)
+        {
+            var payload = new JObject
+            {
+                ["type"] = "event",
+                ["event"] = eventName,
+                ["ts"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0,
+                ["payload"] = new JObject()
+            };
+
+            if (!string.IsNullOrEmpty(projectHash))
+            {
+                payload["project_hash"] = projectHash;
+
+                if (!string.IsNullOrEmpty(projectName))
+                {
+                    payload["instance"] = $"{projectName}@{projectHash}";
+                }
+            }
+
+            return payload;
+        }
+
+        public async Task PushEventAsync(string eventName)
+        {
+            if (string.IsNullOrEmpty(eventName))
+            {
+                return;
+            }
+
+            // Best-effort only: a disconnected socket simply drops the event. The server's bounded
+            // poll remains the backstop for any parked gate call, so silence here is safe.
+            if (!IsConnected || _lifecycleCts == null || _lifecycleCts.IsCancellationRequested)
+            {
+                return;
+            }
+
+            try
+            {
+                JObject payload = BuildEventPayload(eventName, _projectName, _projectHash);
+
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_lifecycleCts.Token);
+                timeoutCts.CancelAfter(EventPushTimeout);
+
+                await SendJsonAsync(payload, timeoutCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Timed out or transport shutting down — drop the event without disturbing the caller.
+            }
+            catch (Exception ex)
+            {
+                McpLog.Debug($"[WebSocket] Event push '{eventName}' failed: {ex.Message}");
+            }
+        }
+
         private async Task HandleExecuteAsync(JObject payload, CancellationToken token)
         {
             string commandId = payload.Value<string>("id");
