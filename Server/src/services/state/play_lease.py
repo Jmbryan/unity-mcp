@@ -206,6 +206,26 @@ class PlayLeaseManager:
             if lease is not None:
                 self._release_locked(key, lease, reason=reason)
 
+    def force_release(
+        self, instance_or_hash: str | None, reason: str = "force_release"
+    ) -> bool:
+        """Clear a lease for an instance regardless of owner (human override).
+
+        Unlike :meth:`get_active_lease`, this inspects the raw lease map so a
+        wedged lease whose TTL/grace would otherwise gate its visibility is
+        still cleared. Also discards any pending play intent for the instance.
+        Returns True when a lease was present and cleared, False when there was
+        nothing to clear. Fails open: never raises.
+        """
+        key = instance_key(instance_or_hash)
+        with self._lock:
+            self._intents.pop(key, None)
+            lease = self._leases.get(key)
+            if lease is None:
+                return False
+            self._release_locked(key, lease, reason=reason)
+            return True
+
     def _release_locked(self, key: str, lease: PlayLease, reason: str) -> None:
         self._leases.pop(key, None)
         logger.info(
@@ -367,6 +387,41 @@ class PlayLeaseManager:
 # Global singleton (simple, process-local) — same pattern as
 # editor_state_cache.
 play_lease_manager = PlayLeaseManager()
+
+
+# ----------------------------------------------------------------------
+# Force-release HTTP control (human dashboard override)
+# ----------------------------------------------------------------------
+async def handle_lease_release_post(request) -> tuple[dict[str, Any], int]:
+    """Force-clear a wedged play lease regardless of owner.
+
+    Accepts a JSON body ``{"instance": "<project_hash or instance id>"}``;
+    ``project_hash`` is tolerated as an alias key. A missing or unreadable
+    body clears nothing. The lease for the resolved instance is force-cleared
+    in the manager and its RunState mirror updated to inactive with
+    ``released_reason="force_release"``.
+
+    Always returns ``({"released": bool, "instance": <resolved>}, 200)``. Fails
+    open: any internal error yields ``released: False`` with a 200 — never a
+    500, never raises.
+    """
+    instance: Any = None
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            instance = body.get("instance")
+            if instance is None:
+                instance = body.get("project_hash")
+        if not isinstance(instance, str) or not instance:
+            return {"released": False, "instance": instance}, 200
+        released = play_lease_manager.force_release(instance, reason="force_release")
+        return {"released": bool(released), "instance": instance}, 200
+    except Exception as exc:
+        logger.debug("play_lease: force-release failed open: %r", exc)
+        return {"released": False, "instance": instance}, 200
 
 
 # ----------------------------------------------------------------------

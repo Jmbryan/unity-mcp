@@ -418,6 +418,21 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
         body, status_code = await handle_agent_status_post(request)
         return JSONResponse(body, status_code=status_code)
 
+    @mcp.custom_route("/lease/release", methods=["POST"])
+    async def lease_release_http(request: Request) -> JSONResponse:
+        """Force-release override for a wedged play lease (human dashboard).
+
+        Accepts ``{"instance": "<project_hash or instance id>"}`` (``project_hash``
+        tolerated as an alias) and force-clears that instance's play lease
+        regardless of owner, updating the RunState mirror to inactive. Always
+        responds 200 with ``{"released": bool, "instance": ...}``; a missing
+        body clears nothing and any internal error fails open — never a 500.
+        """
+        from services.state.play_lease import handle_lease_release_post
+
+        body, status_code = await handle_lease_release_post(request)
+        return JSONResponse(body, status_code=status_code)
+
     @mcp.custom_route("/api/auth/login-url", methods=["GET"])
     async def auth_login_url(_: Request) -> JSONResponse:
         """Return the login URL for users to obtain/manage API keys."""

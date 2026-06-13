@@ -625,3 +625,116 @@ class TestRunStateMirror:
 
         assert lease is not None
         assert play_lease_manager.get_active_lease(INSTANCE) is lease
+
+
+# ----------------------------------------------------------------------
+# Force-release HTTP control (human dashboard override)
+# ----------------------------------------------------------------------
+class _FakeRequest:
+    """Minimal Starlette-Request stand-in with a JSON body (or a raising one)."""
+
+    def __init__(self, payload=None, raise_on_json=False):
+        self._payload = payload
+        self._raise = raise_on_json
+
+    async def json(self):
+        if self._raise:
+            raise ValueError("invalid JSON body")
+        return self._payload
+
+
+class TestForceRelease:
+    """POST /lease/release force-clears a lease regardless of owner; always
+    200, fails open, never raises."""
+
+    @pytest.mark.asyncio
+    async def test_force_release_clears_active_lease(self, tmp_path):
+        play_lease_manager.acquire(
+            INSTANCE, "session-a", "AgentA", project_root=str(tmp_path))
+        assert play_lease_manager.get_active_lease(INSTANCE) is not None
+
+        body, status = await play_lease.handle_lease_release_post(
+            _FakeRequest({"instance": "hash-x"}))
+
+        assert status == 200
+        assert body == {"released": True, "instance": "hash-x"}
+        assert play_lease_manager.get_active_lease(INSTANCE) is None
+        # MCPC-018: mirror flipped to inactive with the override reason.
+        mirror = _read_mirror(tmp_path)
+        assert mirror["active"] is False
+        assert mirror["released_reason"] == "force_release"
+
+    @pytest.mark.asyncio
+    async def test_force_release_ignores_owner(self):
+        """A non-owner override still clears the lease (deliberate human act)."""
+        play_lease_manager.acquire(INSTANCE, "session-owner", "AgentA")
+        assert play_lease_manager.get_active_lease(INSTANCE) is not None
+
+        body, status = await play_lease.handle_lease_release_post(
+            _FakeRequest({"instance": "hash-x"}))
+
+        assert status == 200
+        assert body["released"] is True
+        assert play_lease_manager.get_active_lease(INSTANCE) is None
+
+    @pytest.mark.asyncio
+    async def test_project_hash_alias_key_accepted(self):
+        play_lease_manager.acquire(INSTANCE, "session-a", "AgentA")
+
+        body, status = await play_lease.handle_lease_release_post(
+            _FakeRequest({"project_hash": "hash-x"}))
+
+        assert status == 200
+        assert body == {"released": True, "instance": "hash-x"}
+        assert play_lease_manager.get_active_lease(INSTANCE) is None
+
+    @pytest.mark.asyncio
+    async def test_force_release_absent_lease_is_noop(self):
+        assert play_lease_manager.get_active_lease(INSTANCE) is None
+
+        body, status = await play_lease.handle_lease_release_post(
+            _FakeRequest({"instance": "hash-x"}))
+
+        assert status == 200
+        assert body == {"released": False, "instance": "hash-x"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "payload",
+        [None, "not a dict", 123, {}, {"instance": ""}, {"instance": None}],
+    )
+    async def test_missing_or_malformed_body_tolerated(self, payload):
+        play_lease_manager.acquire(INSTANCE, "session-a", "AgentA")
+
+        body, status = await play_lease.handle_lease_release_post(
+            _FakeRequest(payload))
+
+        assert status == 200
+        assert body["released"] is False
+        # Nothing was cleared: the lease survives a bodyless/garbage call.
+        assert play_lease_manager.get_active_lease(INSTANCE) is not None
+
+    @pytest.mark.asyncio
+    async def test_unreadable_json_body_tolerated(self):
+        play_lease_manager.acquire(INSTANCE, "session-a", "AgentA")
+
+        body, status = await play_lease.handle_lease_release_post(
+            _FakeRequest(raise_on_json=True))
+
+        assert status == 200
+        assert body["released"] is False
+        assert play_lease_manager.get_active_lease(INSTANCE) is not None
+
+    @pytest.mark.asyncio
+    async def test_fail_open_on_internal_error(self, monkeypatch):
+        """An internal manager failure still yields released:False, 200."""
+        def _boom(*_a, **_k):
+            raise RuntimeError("manager exploded")
+
+        monkeypatch.setattr(play_lease_manager, "force_release", _boom)
+
+        body, status = await play_lease.handle_lease_release_post(
+            _FakeRequest({"instance": "hash-x"}))
+
+        assert status == 200
+        assert body == {"released": False, "instance": "hash-x"}
