@@ -484,6 +484,12 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 case "ping":
                     await SendPongAsync(token).ConfigureAwait(false);
                     break;
+                case "session_roster":
+                    // Server-pushed roster (schema unity-mcp/session_roster@1). Parsed off the main
+                    // thread into an immutable snapshot and published to a thread-safe cache; no
+                    // UnityEngine API is touched here. Consumers marshal to the main thread for UI.
+                    SessionRosterService.IngestRosterMessage(payload);
+                    break;
                 default:
                     // No-op for unrecognised types (keep-alives, telemetry, etc.)
                     break;

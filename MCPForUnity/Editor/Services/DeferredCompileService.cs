@@ -265,6 +265,16 @@ namespace MCPForUnity.Editor.Services
 
         #endregion
 
+        /// <summary>
+        /// Public flush entrypoint for service callers (e.g. <see cref="SessionRosterService"/>).
+        /// Flushes a held compile when the editor is idle; a no-op when nothing is pending or a
+        /// play/test span is still active. Must run on the main thread.
+        /// </summary>
+        internal static void FlushNow(string trigger)
+        {
+            FlushIfPending(trigger ?? "flush_now");
+        }
+
         private static void OnPlayModeStateChanged(PlayModeStateChange change)
         {
             switch (change)
