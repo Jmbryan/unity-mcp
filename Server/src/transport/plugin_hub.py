@@ -30,6 +30,8 @@ from transport.models import (
     RegisterToolsMessage,
     PongMessage,
     CommandResultMessage,
+    EventMessage,
+    EDITOR_EDGE_EVENTS,
     SessionList,
     SessionDetails,
 )
@@ -209,6 +211,8 @@ class PluginHub(WebSocketEndpoint):
                 await self._handle_pong(PongMessage(**data))
             elif message_type == "command_result":
                 await self._handle_command_result(CommandResultMessage(**data))
+            elif message_type == "event":
+                self._handle_event(EventMessage(**data))
             else:
                 logger.debug(f"Ignoring plugin message: {data}")
         except Exception as e:
@@ -645,6 +649,52 @@ class PluginHub(WebSocketEndpoint):
         future = entry.get("future") if isinstance(entry, dict) else None
         if future and not future.done():
             future.set_result(result)
+
+    def _handle_event(self, payload: EventMessage) -> None:
+        """Apply a bridge-pushed editor-edge event (MCPC-030).
+
+        Best-effort latency reduction only: it relaxes the cached editor-state
+        snapshot's blocking flags for edges that signal a blocking state has
+        ended and wakes any parked gate calls awaiting the instance's edge
+        signal, so they re-poll immediately instead of waiting out their
+        bounded sleep. The gate's poll cadence and absolute deadline remain
+        the backstop, so an unknown event name or a dropped event never wedges
+        a call — it only forgoes the latency saving. Never raises.
+        """
+        event_name = (payload.event or "").strip()
+        if event_name not in EDITOR_EDGE_EVENTS:
+            logger.debug("Ignoring unknown editor-edge event: %r", event_name)
+            return
+
+        from services.state.editor_state_cache import editor_state_cache
+
+        # The gate keys its cache/poll by whatever instance string it resolved
+        # from session state (Name@hash, bare hash, or the "default" key when
+        # unset). Signal under every key the bridge gave us plus the default
+        # so whichever key a park loop is awaiting gets woken; the optimistic
+        # flag relax only touches keys that actually hold a cached snapshot.
+        keys: list[str | None] = []
+        if payload.instance:
+            keys.append(payload.instance)
+        if payload.project_hash and payload.project_hash != payload.instance:
+            keys.append(payload.project_hash)
+        keys.append(None)  # the "default" instance key
+        for key in keys:
+            try:
+                editor_state_cache.apply_edge_event(key, event_name)
+            except Exception:
+                logger.debug(
+                    "Failed to apply editor-edge event '%s' for key %r",
+                    event_name,
+                    key,
+                    exc_info=True,
+                )
+        logger.debug(
+            "Editor-edge event '%s' applied (instance=%s, hash=%s)",
+            event_name,
+            payload.instance or "default",
+            payload.project_hash or "-",
+        )
 
     async def _handle_pong(self, payload: PongMessage) -> None:
         cls = type(self)

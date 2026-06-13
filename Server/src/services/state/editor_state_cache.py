@@ -90,12 +90,20 @@ class EditorStateCache:
         self._entries: dict[str, _CacheEntry] = {}
         self._edges: dict[str, _ExclusiveEdge] = {}
         self._blocking: dict[str, dict[str, _BlockingObservation]] = {}
+        # Per-instance edge-event signals (MCPC-030). A pushed editor-edge
+        # event sets the instance's asyncio.Event so any park loop awaiting it
+        # wakes immediately instead of waiting out its bounded poll. The signal
+        # is purely a "re-check now" nudge — the poll remains the source of
+        # truth — so it can be coalesced and auto-reset without losing
+        # correctness: a missed signal only costs the poll's normal latency.
+        self._event_signals: dict[str, asyncio.Event] = {}
 
     def reset(self, ttl_s: float | None = None) -> None:
         """Clear all cached state (test seam)."""
         self._entries.clear()
         self._edges.clear()
         self._blocking.clear()
+        self._event_signals.clear()
         if ttl_s is not None:
             self._ttl_s = float(ttl_s)
 
@@ -237,6 +245,99 @@ class EditorStateCache:
         if not records:
             self._blocking.pop(key, None)
         return ages
+
+    # ------------------------------------------------------------------
+    # Edge-event signalling (MCPC-030)
+    # ------------------------------------------------------------------
+    def _signal_for(self, key: str) -> asyncio.Event:
+        signal = self._event_signals.get(key)
+        if signal is None:
+            signal = asyncio.Event()
+            self._event_signals[key] = signal
+        return signal
+
+    def apply_edge_event(
+        self,
+        unity_instance: str | None,
+        event_name: str,
+    ) -> None:
+        """Record a bridge-pushed editor-edge event and wake parked waiters.
+
+        Two effects, both best-effort:
+
+        1. Optimistically *relax* the cached snapshot's blocking flags for
+           edges that mean a blocking state has ended (compile finished,
+           domain reload done, play transition complete). It never *sets* a
+           blocking flag — a lost or stale event must never manufacture a
+           wedge — so the worst case for a spurious clear is one premature
+           re-poll, which immediately re-reads the true state.
+        2. Set the instance's edge signal so any park loop awaiting it wakes
+           now and re-polls, rather than waiting out its bounded sleep.
+
+        Never raises.
+        """
+        key = _instance_key(unity_instance)
+        try:
+            self._relax_blocking_flags(key, event_name)
+        except Exception as exc:
+            logger.debug(
+                "editor_state_cache: edge-event flag relax skipped: %r", exc
+            )
+        # Coalesce: setting an already-set Event is a no-op; waiters that are
+        # not yet awaiting still observe the set flag on their next wait, and
+        # the park loop clears it on consumption so it cannot permanently
+        # latch (see consume_edge_signal).
+        self._signal_for(key).set()
+
+    def _relax_blocking_flags(self, key: str, event_name: str) -> None:
+        """Clear cached blocking flags an edge implies are over (never sets)."""
+        entry = self._entries.get(key)
+        if entry is None:
+            return
+        state = entry.state
+        if not isinstance(state, dict):
+            return
+
+        if event_name in ("compile_finished", "domain_reload_done"):
+            compilation = state.get("compilation")
+            if isinstance(compilation, dict):
+                if compilation.get("is_compiling") is True:
+                    compilation["is_compiling"] = False
+                if compilation.get("is_domain_reload_pending") is True:
+                    compilation["is_domain_reload_pending"] = False
+        elif event_name in ("entered_play", "exited_play"):
+            play_mode = (state.get("editor") or {}).get("play_mode")
+            if isinstance(play_mode, dict) and play_mode.get("is_changing") is True:
+                play_mode["is_changing"] = False
+
+    async def wait_for_edge_event(
+        self,
+        unity_instance: str | None,
+        timeout_s: float,
+    ) -> bool:
+        """Wait up to ``timeout_s`` for an edge event, racing the bounded sleep.
+
+        Returns True if an edge event fired within the window, False on
+        timeout. Either way the signal is auto-reset on return so the next
+        wait starts clean and a single push can't permanently latch the loop
+        awake. Event loss is harmless: the caller's poll cadence is the
+        backstop, so on a False return it simply re-polls as before.
+        """
+        key = _instance_key(unity_instance)
+        signal = self._signal_for(key)
+        try:
+            await asyncio.wait_for(signal.wait(), timeout=max(0.0, timeout_s))
+            fired = True
+        except asyncio.TimeoutError:
+            fired = False
+        except Exception as exc:
+            logger.debug(
+                "editor_state_cache: edge-event wait failed (fail-open): %r", exc
+            )
+            fired = False
+        # Auto-reset so the signal can't leak or permanently latch.
+        signal.clear()
+        return fired
 
 
 # Global singleton (simple, process-local) — same pattern as

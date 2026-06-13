@@ -701,7 +701,13 @@ async def gate_for_class(
         if now - last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
             last_heartbeat = now
             await _report_progress(ctx, now - started, budget, reason, owner)
-        await asyncio.sleep(sleep_s)
+        # Race the bounded poll sleep against a bridge-pushed edge event
+        # (MCPC-030): a relevant pushed event (compile/reload/play edge)
+        # releases the park immediately, while the sleep timeout keeps the
+        # periodic state refresh and the absolute deadline as backstops. Event
+        # loss can never wedge — on timeout the loop re-polls exactly as a
+        # plain sleep would have. The signal auto-resets on consumption.
+        await editor_state_cache.wait_for_edge_event(unity_instance, sleep_s)
 
 
 async def gate_tool_call(ctx, tool_name: str, arguments: Any) -> dict[str, Any] | None:
