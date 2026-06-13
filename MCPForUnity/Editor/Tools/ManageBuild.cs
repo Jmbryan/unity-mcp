@@ -11,7 +11,7 @@ using MCPForUnity.Editor.Tools.Build;
 namespace MCPForUnity.Editor.Tools
 {
     [McpForUnityTool("manage_build", AutoRegister = false, Group = "core",
-        RequiresPolling = true, PollAction = "status", MaxPollSeconds = 1800)]
+        RequiresPolling = true, PollAction = "status", MaxPollSeconds = 1800, ConcurrencyClass = "exclusive")]
     public static class ManageBuild
     {
         private static readonly string[] ValidActions =

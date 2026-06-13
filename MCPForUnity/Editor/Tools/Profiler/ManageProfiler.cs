@@ -5,7 +5,7 @@ using Newtonsoft.Json.Linq;
 
 namespace MCPForUnity.Editor.Tools.Profiler
 {
-    [McpForUnityTool("manage_profiler", AutoRegister = false, Group = "profiling")]
+    [McpForUnityTool("manage_profiler", AutoRegister = false, Group = "profiling", ConcurrencyClass = "read")]
     public static class ManageProfiler
     {
         public static async Task<object> HandleCommand(JObject @params)

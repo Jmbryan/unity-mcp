@@ -156,6 +156,7 @@ namespace MCPForUnity.Editor.Services
                     RequiresPolling = toolAttr.RequiresPolling,
                     PollAction = string.IsNullOrEmpty(toolAttr.PollAction) ? "status" : toolAttr.PollAction,
                     MaxPollSeconds = toolAttr.MaxPollSeconds,
+                    ConcurrencyClass = string.IsNullOrWhiteSpace(toolAttr.ConcurrencyClass) ? "mutate" : toolAttr.ConcurrencyClass,
                     Group = toolAttr.Group ?? "core"
                 };
 

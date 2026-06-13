@@ -534,34 +534,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             foreach (var tool in tools)
             {
-                var toolObj = new JObject
-                {
-                    ["name"] = tool.Name,
-                    ["description"] = tool.Description,
-                    ["structured_output"] = tool.StructuredOutput,
-                    ["requires_polling"] = tool.RequiresPolling,
-                    ["poll_action"] = tool.PollAction ?? "status",
-                    ["max_poll_seconds"] = tool.MaxPollSeconds,
-                    ["group"] = string.IsNullOrWhiteSpace(tool.Group) ? "core" : tool.Group
-                };
-
-                var paramsArray = new JArray();
-                if (tool.Parameters != null)
-                {
-                    foreach (var p in tool.Parameters)
-                    {
-                        paramsArray.Add(new JObject
-                        {
-                            ["name"] = p.Name,
-                            ["description"] = p.Description,
-                            ["type"] = p.Type,
-                            ["required"] = p.Required,
-                            ["default_value"] = p.DefaultValue
-                        });
-                    }
-                }
-                toolObj["parameters"] = paramsArray;
-                toolsArray.Add(toolObj);
+                toolsArray.Add(BuildToolRegistrationObject(tool));
             }
 
             var payload = new JObject
@@ -572,6 +545,44 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             await SendJsonAsync(payload, token).ConfigureAwait(false);
             McpLog.Info($"[WebSocket] Sent {tools.Count} tools registration", false);
+        }
+
+        /// <summary>
+        /// Builds the registration payload object for a single tool. Kept as a discrete
+        /// static helper so the registration shape (including the concurrency class the
+        /// multi-agent gate depends on) is unit-testable in isolation.
+        /// </summary>
+        private static JObject BuildToolRegistrationObject(ToolMetadata tool)
+        {
+            var toolObj = new JObject
+            {
+                ["name"] = tool.Name,
+                ["description"] = tool.Description,
+                ["structured_output"] = tool.StructuredOutput,
+                ["requires_polling"] = tool.RequiresPolling,
+                ["poll_action"] = tool.PollAction ?? "status",
+                ["max_poll_seconds"] = tool.MaxPollSeconds,
+                ["concurrency_class"] = string.IsNullOrWhiteSpace(tool.ConcurrencyClass) ? "mutate" : tool.ConcurrencyClass,
+                ["group"] = string.IsNullOrWhiteSpace(tool.Group) ? "core" : tool.Group
+            };
+
+            var paramsArray = new JArray();
+            if (tool.Parameters != null)
+            {
+                foreach (var p in tool.Parameters)
+                {
+                    paramsArray.Add(new JObject
+                    {
+                        ["name"] = p.Name,
+                        ["description"] = p.Description,
+                        ["type"] = p.Type,
+                        ["required"] = p.Required,
+                        ["default_value"] = p.DefaultValue
+                    });
+                }
+            }
+            toolObj["parameters"] = paramsArray;
+            return toolObj;
         }
 
         public async Task ReregisterToolsAsync()

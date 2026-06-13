@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using MCPForUnity.Editor.Services;
 using MCPForUnity.Editor.Services.Transport.Transports;
+using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 
 namespace MCPForUnityTests.Editor.Services
@@ -80,6 +82,52 @@ namespace MCPForUnityTests.Editor.Services
                 Assert.AreEqual("/custom/path", candidate.AbsolutePath);
                 Assert.AreEqual("?mode=test", candidate.Query);
             }
+        }
+
+        [Test]
+        public void BuildToolRegistrationObject_IncludesExplicitConcurrencyClass()
+        {
+            // Arrange
+            var tool = new ToolMetadata
+            {
+                Name = "sample_tool",
+                Description = "desc",
+                ConcurrencyClass = "exclusive"
+            };
+
+            // Act
+            JObject payload = InvokeBuildToolRegistrationObject(tool);
+
+            // Assert
+            Assert.AreEqual("exclusive", payload.Value<string>("concurrency_class"));
+        }
+
+        [Test]
+        public void BuildToolRegistrationObject_DefaultsToMutate_WhenConcurrencyClassMissing()
+        {
+            // Arrange - empty/whitespace class should fall back to the safe default
+            var tool = new ToolMetadata
+            {
+                Name = "sample_tool",
+                Description = "desc",
+                ConcurrencyClass = "   "
+            };
+
+            // Act
+            JObject payload = InvokeBuildToolRegistrationObject(tool);
+
+            // Assert
+            Assert.AreEqual("mutate", payload.Value<string>("concurrency_class"));
+        }
+
+        private static JObject InvokeBuildToolRegistrationObject(ToolMetadata tool)
+        {
+            const BindingFlags flags = BindingFlags.NonPublic | BindingFlags.Static;
+            MethodInfo method = typeof(WebSocketTransportClient).GetMethod("BuildToolRegistrationObject", flags);
+            Assert.IsNotNull(method, "Expected private static BuildToolRegistrationObject(ToolMetadata) to exist.");
+            var result = method.Invoke(null, new object[] { tool });
+            Assert.IsInstanceOf<JObject>(result);
+            return (JObject)result;
         }
 
         private static List<Uri> InvokeBuildConnectionCandidateUris(Uri endpoint)

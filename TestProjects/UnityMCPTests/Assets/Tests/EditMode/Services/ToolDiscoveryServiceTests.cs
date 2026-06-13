@@ -114,6 +114,52 @@ namespace MCPForUnity.Editor.Tests.EditMode.Services
         }
 
         [Test]
+        public void DiscoverAllTools_AllToolsCarryConcurrencyClass()
+        {
+            // Arrange
+            var service = new ToolDiscoveryService();
+            var validClasses = new[] { "read", "mutate", "exclusive", "play-scoped" };
+
+            // Act
+            var tools = service.DiscoverAllTools();
+
+            // Assert - every discovered tool advertises a non-empty, recognized class
+            Assert.IsNotEmpty(tools, "Expected at least one discovered tool.");
+            foreach (var tool in tools)
+            {
+                Assert.IsFalse(string.IsNullOrWhiteSpace(tool.ConcurrencyClass),
+                    $"Tool '{tool.Name}' should carry a concurrency class.");
+                CollectionAssert.Contains(validClasses, tool.ConcurrencyClass,
+                    $"Tool '{tool.Name}' has unexpected concurrency class '{tool.ConcurrencyClass}'.");
+            }
+        }
+
+        [Test]
+        public void DiscoverAllTools_MapsExplicitAndDefaultConcurrencyClasses()
+        {
+            // Arrange
+            var service = new ToolDiscoveryService();
+
+            // Act
+            var tools = service.DiscoverAllTools();
+
+            // Assert - explicit read tag flows through
+            var read = tools.FirstOrDefault(t => t.Name == "find_gameobjects");
+            Assert.IsNotNull(read, "Expected built-in 'find_gameobjects' to be discovered.");
+            Assert.AreEqual("read", read.ConcurrencyClass);
+
+            // explicit exclusive tag flows through
+            var exclusive = tools.FirstOrDefault(t => t.Name == "refresh_unity");
+            Assert.IsNotNull(exclusive, "Expected built-in 'refresh_unity' to be discovered.");
+            Assert.AreEqual("exclusive", exclusive.ConcurrencyClass);
+
+            // untagged tool falls back to the safe 'mutate' default
+            var mutate = tools.FirstOrDefault(t => t.Name == "manage_gameobject");
+            Assert.IsNotNull(mutate, "Expected built-in 'manage_gameobject' to be discovered.");
+            Assert.AreEqual("mutate", mutate.ConcurrencyClass);
+        }
+
+        [Test]
         public void DiscoverAllTools_DoesNotOverrideStoredFalse_ForBuiltInAutoRegisterFalseTool()
         {
             // Arrange

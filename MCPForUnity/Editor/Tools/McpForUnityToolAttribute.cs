@@ -58,6 +58,16 @@ namespace MCPForUnity.Editor.Tools
         public int MaxPollSeconds { get; set; } = 0;
 
         /// <summary>
+        /// Concurrency class advertised to the server for the multi-agent operation gate.
+        /// One of: "read" (always passes), "mutate" (parks while the editor is busy),
+        /// "exclusive" (triggers compile/domain-reload/test transitions), or "play-scoped"
+        /// (executes only for the play-lease owner). Defaults to "mutate" — the safe default
+        /// for untagged tools. Argument-dependent tools keep a single static class here; the
+        /// server overrides per-argument from its own table.
+        /// </summary>
+        public string ConcurrencyClass { get; set; } = "mutate";
+
+        /// <summary>
         /// The command name used to route requests to this tool.
         /// If not specified, defaults to the PascalCase class name converted to snake_case.
         /// Kept for backward compatibility.

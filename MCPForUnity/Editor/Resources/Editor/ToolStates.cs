@@ -51,6 +51,7 @@ namespace MCPForUnity.Editor.Resources.Editor
                         ["requires_polling"] = tool.RequiresPolling,
                         ["poll_action"] = tool.PollAction ?? "status",
                         ["max_poll_seconds"] = tool.MaxPollSeconds,
+                        ["concurrency_class"] = tool.ConcurrencyClass ?? "mutate",
                         ["parameters"] = paramsArray
                     });
                 }
