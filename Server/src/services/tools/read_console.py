@@ -26,6 +26,7 @@ def _strip_stacktrace_from_list(items: list) -> None:
     annotations=ToolAnnotations(
         title="Read Console",
     ),
+    concurrency_class="read",
 )
 async def read_console(
     ctx: Context,

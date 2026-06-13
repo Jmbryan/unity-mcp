@@ -8,6 +8,8 @@ from .tool_registry import (
     clear_tool_registry,
     TOOL_GROUPS,
     DEFAULT_ENABLED_GROUPS,
+    CONCURRENCY_CLASSES,
+    DEFAULT_CONCURRENCY_CLASS,
 )
 from .resource_registry import (
     mcp_for_unity_resource,
@@ -22,6 +24,8 @@ __all__ = [
     'clear_tool_registry',
     'TOOL_GROUPS',
     'DEFAULT_ENABLED_GROUPS',
+    'CONCURRENCY_CLASSES',
+    'DEFAULT_CONCURRENCY_CLASS',
     'mcp_for_unity_resource',
     'get_registered_resources',
     'clear_resource_registry'

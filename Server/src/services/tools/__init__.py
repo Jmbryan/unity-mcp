@@ -206,6 +206,7 @@ async def sync_tool_visibility_from_unity(
                                 requires_polling=td.get("requires_polling", False),
                                 poll_action=td.get("poll_action") or "status",
                                 max_poll_seconds=td.get("max_poll_seconds", 0),
+                                concurrency_class=td.get("concurrency_class", "mutate"),
                                 parameters=params,
                             )
                         )

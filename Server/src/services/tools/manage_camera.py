@@ -75,6 +75,7 @@ ALL_ACTIONS = SETUP_ACTIONS + CREATION_ACTIONS + CONFIGURATION_ACTIONS + EXTENSI
         title="Manage Camera",
         destructiveHint=True,
     ),
+    concurrency_class="play-scoped",
 )
 async def manage_camera(
     ctx: Context,

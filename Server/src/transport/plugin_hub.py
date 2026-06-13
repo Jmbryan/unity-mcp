@@ -810,12 +810,27 @@ class PluginHub(WebSocketEndpoint):
         return False
 
     @staticmethod
-    def _unavailable_retry_response(reason: str = "no_unity_session") -> dict[str, Any]:
+    def _unavailable_retry_response(
+        reason: str = "no_unity_session",
+        *,
+        owner: str | None = None,
+        message: str | None = None,
+        retry_after_ms: int = 250,
+    ) -> dict[str, Any]:
+        """Structured retry/busy response.
+
+        ``owner`` carries the blocking session's display name or label so
+        busy/parked results are attributed ("busy — owned by X") instead of
+        anonymous.
+        """
+        data: dict[str, Any] = {"reason": reason, "retry_after_ms": retry_after_ms}
+        if owner:
+            data["blocked_by"] = owner
         return MCPResponse(
             success=False,
-            error="Unity session not available; please retry",
+            error=message or "Unity session not available; please retry",
             hint="retry",
-            data={"reason": reason, "retry_after_ms": 250},
+            data=data,
         ).model_dump()
 
     # ------------------------------------------------------------------

@@ -150,6 +150,7 @@ class GetTestJobResponse(MCPResponse):
         title="Run Tests",
         destructiveHint=True,
     ),
+    concurrency_class="exclusive",
 )
 async def run_tests(
     ctx: Context,
@@ -227,6 +228,7 @@ async def run_tests(
         title="Get Test Job",
         readOnlyHint=True,
     ),
+    concurrency_class="read",
 )
 async def get_test_job(
     ctx: Context,

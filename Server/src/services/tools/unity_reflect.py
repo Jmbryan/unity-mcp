@@ -40,6 +40,7 @@ async def _send_reflect_command(
         readOnlyHint=True,
         destructiveHint=False,
     ),
+    concurrency_class="read",
 )
 async def unity_reflect(
     ctx: Context,

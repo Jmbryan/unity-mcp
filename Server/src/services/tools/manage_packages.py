@@ -52,6 +52,7 @@ async def _send_packages_command(
         destructiveHint=True,
         readOnlyHint=False,
     ),
+    concurrency_class="exclusive",
 )
 async def manage_packages(
     ctx: Context,

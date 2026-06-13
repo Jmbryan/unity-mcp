@@ -77,10 +77,11 @@ class _DummyMiddlewareContext:
 
 
 class _DummyToolResult:
-    """Stub for fastmcp.server.server.ToolResult"""
-    def __init__(self, content=None, is_error=False):
+    """Stub for fastmcp.server.server.ToolResult (mirrors the real signature)."""
+    def __init__(self, content=None, structured_content=None, meta=None):
         self.content = content or []
-        self.is_error = is_error
+        self.structured_content = structured_content
+        self.meta = meta
 
 
 fastmcp.FastMCP = _DummyFastMCP

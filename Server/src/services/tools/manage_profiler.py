@@ -59,6 +59,7 @@ ALL_ACTIONS = (
         destructiveHint=False,
         readOnlyHint=False,
     ),
+    concurrency_class="read",
 )
 async def manage_profiler(
     ctx: Context,

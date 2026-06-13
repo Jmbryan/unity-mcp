@@ -718,6 +718,7 @@ async def _lookup(
         readOnlyHint=True,
         destructiveHint=False,
     ),
+    concurrency_class="read",
 )
 async def unity_docs(
     ctx: Context,

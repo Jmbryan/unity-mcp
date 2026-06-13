@@ -481,6 +481,7 @@ async def delete_script(
         title="Validate Script",
         readOnlyHint=True,
     ),
+    concurrency_class="read",
 )
 async def validate_script(
     ctx: Context,
@@ -627,6 +628,7 @@ async def manage_script(
         title="Manage Script Capabilities",
         readOnlyHint=True,
     ),
+    concurrency_class="read",
 )
 async def manage_script_capabilities(ctx: Context) -> dict[str, Any]:
     await ctx.info("Processing manage_script_capabilities")
@@ -659,6 +661,7 @@ async def manage_script_capabilities(ctx: Context) -> dict[str, Any]:
         title="Get SHA",
         readOnlyHint=True,
     ),
+    concurrency_class="read",
 )
 async def get_sha(
     ctx: Context,

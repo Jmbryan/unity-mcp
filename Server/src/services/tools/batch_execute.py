@@ -8,6 +8,12 @@ from fastmcp import Context
 from mcp.types import ToolAnnotations
 
 from services.registry import mcp_for_unity_tool
+from services.state.operation_gate import (
+    CLASS_READ,
+    escalate_class,
+    gate_for_class,
+    resolve_tool_class,
+)
 from services.tools import get_unity_instance_from_context
 from transport.unity_transport import send_with_unity_instance
 from transport.legacy.unity_connection import async_send_command_with_retry
@@ -73,6 +79,7 @@ def invalidate_cached_max_commands() -> None:
         title="Batch Execute",
         destructiveHint=True,
     ),
+    concurrency_class="wrapper",
 )
 async def batch_execute(
     ctx: Context,
@@ -127,6 +134,20 @@ async def batch_execute(
             "tool": tool_name,
             "params": params,
         })
+
+    # Unwrap the batch for the operation-class gate: inner commands bypass the
+    # per-tool middleware, so classify each one here and gate the whole batch
+    # at the max-severity class (a batch of reads stays a read).
+    user_id = await get_unity_instance_from_context(ctx, "user_id")
+    effective_class = CLASS_READ
+    for command in normalized_commands:
+        inner_class = await resolve_tool_class(
+            command["tool"], command["params"], unity_instance, user_id
+        )
+        effective_class = escalate_class(effective_class, inner_class)
+    busy = await gate_for_class(ctx, effective_class, "batch_execute", unity_instance)
+    if busy is not None:
+        return busy
 
     payload: dict[str, Any] = {
         "commands": normalized_commands,

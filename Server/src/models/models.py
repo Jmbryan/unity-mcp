@@ -29,6 +29,10 @@ class ToolDefinitionModel(BaseModel):
     requires_polling: bool | None = False
     poll_action: str | None = "status"
     max_poll_seconds: int = 0
+    # Declared concurrency class from the bridge's register_tools payload
+    # ("read" / "mutate" / "exclusive" / "play-scoped"). Older bridges omit it;
+    # the operation gate treats unknown or missing values as "mutate".
+    concurrency_class: str | None = "mutate"
     parameters: list[ToolParameterModel] = Field(default_factory=list)
 
 

@@ -18,6 +18,7 @@ from core.config import config
     annotations=ToolAnnotations(
         title="Set Active Instance",
     ),
+    concurrency_class="read",
 )
 async def set_active_instance(
         ctx: Context,

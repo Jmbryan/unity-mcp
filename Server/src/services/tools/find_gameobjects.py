@@ -21,7 +21,8 @@ from services.tools.preflight import preflight
         "Then use mcpforunity://scene/gameobject/{id} resource for full data, "
         "or mcpforunity://scene/gameobject/{id}/components for component details. "
         "For CRUD operations (create/modify/delete), use manage_gameobject instead."
-    )
+    ),
+    concurrency_class="read",
 )
 async def find_gameobjects(
     ctx: Context,

@@ -71,6 +71,8 @@ async def test_execute_custom_tool_threads_user_id_from_context(monkeypatch):
     ctx.get_state = AsyncMock(side_effect=lambda key, default=None: state.get(key, default))
 
     service = Mock()
+    # The tool resolves the definition for gate classification; None skips the gate.
+    service.get_tool_definition = AsyncMock(return_value=None)
     service.execute_tool = AsyncMock(return_value=MCPResponse(success=True, message="ok"))
 
     with patch("services.tools.execute_custom_tool.resolve_project_id_for_unity_instance", return_value="project-hash"):

@@ -29,12 +29,21 @@ TOOL_GROUPS: dict[str, str] = {
 
 DEFAULT_ENABLED_GROUPS: set[str] = {"core"}
 
+# Concurrency classes for the operation-class gate. ``wrapper`` is
+# server-internal: the tool's effective class is computed inside its own body
+# (batch/custom-tool dispatch), so the middleware gate passes it through.
+CONCURRENCY_CLASSES: set[str] = {
+    "read", "mutate", "exclusive", "play-scoped", "wrapper",
+}
+DEFAULT_CONCURRENCY_CLASS = "mutate"
+
 
 def mcp_for_unity_tool(
     name: str | None = None,
     description: str | None = None,
     unity_target: str | None = "self",
     group: str | None = "core",
+    concurrency_class: str | None = None,
     **kwargs
 ) -> Callable:
     """
@@ -53,6 +62,12 @@ def mcp_for_unity_tool(
             - A group name string (e.g. "core", "vfx") assigns the tool to
               that group and adds a ``tags={"group:<name>"}`` entry.
             - None: the tool is *always visible* (server meta-tools).
+        concurrency_class: Declared concurrency class for the operation gate.
+            One of "read" (always passes), "mutate" (default; parks while the
+            editor is busy), "exclusive" (compile/test/package-ish; also gated
+            during test runs and by the compile fence), "play-scoped"
+            (mutates a running play session), or "wrapper" (effective class is
+            computed inside the tool body). None means the default ("mutate").
         **kwargs: Additional arguments passed to @mcp.tool()
 
     Example:
@@ -68,6 +83,20 @@ def mcp_for_unity_tool(
             del tool_kwargs["unity_target"]
         if "group" in tool_kwargs:
             del tool_kwargs["group"]
+        if "concurrency_class" in tool_kwargs:
+            del tool_kwargs["concurrency_class"]
+
+        # Validate and normalize concurrency class
+        resolved_class = (
+            DEFAULT_CONCURRENCY_CLASS
+            if concurrency_class is None
+            else concurrency_class
+        )
+        if resolved_class not in CONCURRENCY_CLASSES:
+            raise ValueError(
+                f"Unknown concurrency_class '{concurrency_class}' for tool '{tool_name}'. "
+                f"Valid classes: {', '.join(sorted(CONCURRENCY_CLASSES))}."
+            )
 
         # Validate and normalize group
         resolved_group: str | None = None
@@ -101,6 +130,7 @@ def mcp_for_unity_tool(
             'description': description,
             'unity_target': normalized_unity_target,
             'group': resolved_group,
+            'concurrency_class': resolved_class,
             'kwargs': tool_kwargs,
         })
 

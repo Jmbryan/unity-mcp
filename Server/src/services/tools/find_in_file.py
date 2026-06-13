@@ -72,6 +72,7 @@ def _split_uri(uri: str) -> tuple[str, str]:
         title="Find in File",
         readOnlyHint=True,
     ),
+    concurrency_class="read",
 )
 async def find_in_file(
     ctx: Context,

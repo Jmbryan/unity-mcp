@@ -556,9 +556,46 @@ class UnityInstanceMiddleware(Middleware):
                 await ctx.set_state("unity_session_id", session_id)
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
-        """Inject active Unity instance into tool context if available."""
+        """Inject active Unity instance, then apply the operation-class gate.
+
+        The gate parks mutate/exclusive/play-scoped calls while the editor is
+        busy and converts to a structured busy result past the park budget.
+        Reads always pass; resource reads and tool listing are never gated.
+        """
         await self._inject_unity_instance(context)
+        busy = await self._gate_tool_call(context)
+        if busy is not None:
+            import json
+
+            from fastmcp.server.server import ToolResult
+
+            return ToolResult(
+                content=json.dumps(busy),
+                structured_content=busy,
+            )
         return await call_next(context)
+
+    async def _gate_tool_call(self, context: MiddlewareContext) -> dict | None:
+        """Run the operation-class gate for one tool call. Fails open."""
+        try:
+            message = getattr(context, "message", None)
+            tool_name = getattr(message, "name", None)
+            if not isinstance(tool_name, str) or not tool_name:
+                return None
+            arguments = getattr(message, "arguments", None)
+
+            from services.state.operation_gate import gate_tool_call
+
+            return await gate_tool_call(context.fastmcp_context, tool_name, arguments)
+        except Exception as exc:
+            if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+                raise
+            _diag.debug(
+                "operation gate failed open for tool call (%s)",
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return None
 
     async def on_read_resource(self, context: MiddlewareContext, call_next):
         """Inject active Unity instance into resource context if available."""

@@ -13,6 +13,7 @@ from fastmcp import Context
 from mcp.types import ToolAnnotations
 
 from services.registry import mcp_for_unity_tool
+from services.state.operation_gate import record_exclusive_edge_after_arbitrary_code
 from services.tools import get_unity_instance_from_context
 from transport.unity_transport import send_with_unity_instance
 from transport.legacy.unity_connection import async_send_command_with_retry
@@ -93,6 +94,12 @@ async def execute_code(
 
     if not isinstance(response, dict):
         return {"success": False, "message": str(response)}
+
+    # Arbitrary code can't be classified by inspection. If the execution
+    # kicked off an exclusive editor transition (compile, play enter), assign
+    # its ownership to this session after the fact.
+    if action in ("execute", "replay") and response.get("success", False):
+        await record_exclusive_edge_after_arbitrary_code(ctx, unity_instance)
 
     return {
         "success": response.get("success", False),

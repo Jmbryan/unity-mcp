@@ -20,6 +20,7 @@ from transport.plugin_hub import PluginHub
         title="Debug Request Context",
         readOnlyHint=True,
     ),
+    concurrency_class="read",
 )
 async def debug_request_context(ctx: Context) -> dict[str, Any]:
     # Check request_context properties

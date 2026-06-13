@@ -46,6 +46,7 @@ async def _send_build_command(
         destructiveHint=True,
         readOnlyHint=False,
     ),
+    concurrency_class="exclusive",
 )
 async def manage_build(
     ctx: Context,

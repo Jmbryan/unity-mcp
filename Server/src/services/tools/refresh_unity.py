@@ -186,6 +186,7 @@ async def verify_edit_by_sha(
         title="Refresh Unity",
         destructiveHint=True,
     ),
+    concurrency_class="exclusive",
 )
 async def refresh_unity(
     ctx: Context,

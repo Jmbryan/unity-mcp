@@ -37,6 +37,7 @@ from services.registry import (
         title="Manage Tools",
         readOnlyHint=False,
     ),
+    concurrency_class="read",
 )
 async def manage_tools(
     ctx: Context,
