@@ -15,6 +15,9 @@ effective class is computed inside the wrapper's own body). The gate enforces:
   while another session's edit-ledger entries are hot (edited within the
   quiescence window), proceeding when that session quiesces. A session's own
   edits never park its own compile.
+- While a play lease is active (``play_lease``), ``play-scoped`` and
+  ``exclusive`` calls are owner-only: non-owners receive an immediate
+  structured busy result naming the owner (after validate-on-block).
 
 Classification resolves in order: per-argument override table (for tools whose
 class depends on arguments), the server tool registry, the bridge-registered
@@ -440,6 +443,23 @@ async def gate_for_class(
                 block = None
 
         if block is None:
+            # Play-lease enforcement (MCPC-013/014/015): while a play lease
+            # is active, play-scoped and exclusive calls are owner-only.
+            # Unlike editor-busy blocks this never parks — play sessions run
+            # for minutes — it refuses immediately (after validate-on-block).
+            try:
+                from services.state.play_lease import enforce_lease
+
+                lease_busy = await enforce_lease(
+                    ctx, concurrency_class, tool_name, unity_instance
+                )
+            except Exception as exc:
+                logger.debug(
+                    "operation_gate: lease check failed (fail-open): %r", exc
+                )
+                lease_busy = None
+            if lease_busy is not None:
+                return lease_busy
             if concurrency_class == CLASS_EXCLUSIVE:
                 # The caller is about to drive an exclusive transition; record
                 # it as the owner so calls parked behind it see attribution.
@@ -511,6 +531,12 @@ async def record_exclusive_edge_after_arbitrary_code(ctx, unity_instance: str | 
         owner = await _session_display_name(ctx)
         if owner:
             editor_state_cache.record_exclusive_edge(unity_instance, owner, kind=kind)
+        if kind == "play_transition":
+            # The arbitrary code started a play transition: attribute the
+            # upcoming play lease to this session as well.
+            from services.state.play_lease import record_play_intent_for_session
+
+            await record_play_intent_for_session(ctx, unity_instance)
     except Exception as exc:
         logger.debug(
             "operation_gate: post-hoc exclusive-edge recording skipped: %r", exc

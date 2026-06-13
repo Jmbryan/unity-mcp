@@ -561,6 +561,12 @@ class UnityInstanceMiddleware(Middleware):
         The gate parks mutate/exclusive/play-scoped calls while the editor is
         busy and converts to a structured busy result past the park budget.
         Reads always pass; resource reads and tool listing are never gated.
+
+        Around the dispatch, play-enter/exit calls feed the play lease: a
+        dispatched play call records an intent (so the lease attributes
+        correctly even when the play-enter domain reload eats the result),
+        and observed play/pause/stop outcomes acquire, renew, or release the
+        lease implicitly.
         """
         await self._inject_unity_instance(context)
         busy = await self._gate_tool_call(context)
@@ -573,7 +579,58 @@ class UnityInstanceMiddleware(Middleware):
                 content=json.dumps(busy),
                 structured_content=busy,
             )
-        return await call_next(context)
+        tool_name, arguments = self._tool_call_shape(context)
+        await self._note_play_dispatch(context, tool_name, arguments)
+        result = await call_next(context)
+        await self._observe_play_result(context, tool_name, arguments, result)
+        return result
+
+    @staticmethod
+    def _tool_call_shape(context: MiddlewareContext) -> tuple[str | None, dict | None]:
+        message = getattr(context, "message", None)
+        tool_name = getattr(message, "name", None)
+        if not isinstance(tool_name, str) or not tool_name:
+            tool_name = None
+        arguments = getattr(message, "arguments", None)
+        if not isinstance(arguments, dict):
+            arguments = None
+        return tool_name, arguments
+
+    async def _note_play_dispatch(self, context, tool_name, arguments) -> None:
+        """Record a play intent for a dispatched play-enter call. Fails open."""
+        if tool_name is None:
+            return
+        try:
+            from services.state.play_lease import note_play_call_dispatch
+
+            await note_play_call_dispatch(
+                context.fastmcp_context, tool_name, arguments)
+        except Exception as exc:
+            if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+                raise
+            _diag.debug(
+                "play-lease intent recording failed open (%s)",
+                type(exc).__name__,
+                exc_info=True,
+            )
+
+    async def _observe_play_result(self, context, tool_name, arguments, result) -> None:
+        """Feed a play/pause/stop call's outcome to the play lease. Fails open."""
+        if tool_name is None:
+            return
+        try:
+            from services.state.play_lease import observe_play_call_result
+
+            await observe_play_call_result(
+                context.fastmcp_context, tool_name, arguments, result)
+        except Exception as exc:
+            if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+                raise
+            _diag.debug(
+                "play-lease result observation failed open (%s)",
+                type(exc).__name__,
+                exc_info=True,
+            )
 
     async def _gate_tool_call(self, context: MiddlewareContext) -> dict | None:
         """Run the operation-class gate for one tool call. Fails open."""

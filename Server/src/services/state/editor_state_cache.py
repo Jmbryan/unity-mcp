@@ -101,7 +101,22 @@ class EditorStateCache:
             return None
 
         self._entries[key] = _CacheEntry(state=state, fetched_at=time.monotonic())
+        await self._notify_play_lease(unity_instance, state)
         return state
+
+    async def _notify_play_lease(
+        self, unity_instance: str | None, state: dict[str, Any]
+    ) -> None:
+        """Feed fresh snapshots to the play lease (acquire on human play-enter,
+        renew while playing, clear on play exit). Never raises."""
+        try:
+            from services.state.play_lease import play_lease_manager
+
+            await play_lease_manager.observe_editor_state(unity_instance, state)
+        except Exception as exc:
+            logger.debug(
+                "editor_state_cache: play-lease observation skipped: %r", exc
+            )
 
     async def _fetch(self, ctx) -> dict[str, Any] | None:
         """One bounded editor-state fetch. Any failure is a miss (fail open)."""

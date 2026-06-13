@@ -11,6 +11,26 @@ from core.config import config
 from models.models import ToolDefinitionModel
 
 
+def _notify_play_lease_instance_registered(project_hash: str) -> None:
+    """Cancel a lease's disconnect grace on (re)registration. Fails open."""
+    try:
+        from services.state.play_lease import play_lease_manager
+
+        play_lease_manager.mark_instance_registered(project_hash)
+    except Exception:
+        pass
+
+
+def _notify_play_lease_instance_disconnected(project_hash: str) -> None:
+    """Start a lease's disconnect grace window. Fails open."""
+    try:
+        from services.state.play_lease import play_lease_manager
+
+        play_lease_manager.mark_instance_disconnected(project_hash)
+    except Exception:
+        pass
+
+
 @dataclass(slots=True)
 class PluginSession:
     """Represents a single Unity plugin connection."""
@@ -102,6 +122,9 @@ class PluginRegistry:
                 self._hash_to_session[project_hash] = session_id
 
             self._sessions[session_id] = session
+            # The instance (project identity) is live again: cancel any
+            # pending play-lease grace expiry from a domain-reload disconnect.
+            _notify_play_lease_instance_registered(project_hash)
             return session, evicted_session_id
 
     async def touch(self, session_id: str) -> None:
@@ -118,11 +141,13 @@ class PluginRegistry:
         async with self._lock:
             session = self._sessions.pop(session_id, None)
             if session:
+                instance_went_away = False
                 # Clean up hash mappings
                 if session.project_hash in self._hash_to_session:
                     mapped = self._hash_to_session.get(session.project_hash)
                     if mapped == session_id:
                         del self._hash_to_session[session.project_hash]
+                        instance_went_away = True
 
                 # Clean up user-scoped mappings
                 if session.user_id:
@@ -131,6 +156,14 @@ class PluginRegistry:
                         mapped = self._user_hash_to_session.get(composite_key)
                         if mapped == session_id:
                             del self._user_hash_to_session[composite_key]
+                            instance_went_away = True
+
+                # The instance (not just a superseded WebSocket session)
+                # disconnected: start the play lease's reconnect grace
+                # window so a held lease fails open if the editor is gone.
+                if instance_went_away:
+                    _notify_play_lease_instance_disconnected(
+                        session.project_hash)
 
     async def register_tools_for_session(self, session_id: str, tools: list[ToolDefinitionModel]) -> None:
         """Register tools for a specific session."""
