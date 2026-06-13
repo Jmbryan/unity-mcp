@@ -322,7 +322,7 @@ namespace MCPForUnity.Editor.Services
             {
                 activityPhase = "asset_import";
             }
-            else if (EditorApplication.isPlayingOrWillChangePlaymode)
+            else if (ComputeIsChangingPlaymode(isPlaying, EditorApplication.isPlayingOrWillChangePlaymode))
             {
                 activityPhase = "playmode_transition";
             }
@@ -391,6 +391,15 @@ namespace MCPForUnity.Editor.Services
             string currentJobId = TestJobManager.CurrentJobId;
             bool isFocused = InternalEditorUtility.isApplicationActive;
 
+            // Reconcile the play-mode transition from current EditorApplication facts rather than
+            // trusting playModeStateChanged event continuity. The play-entry domain reload destroys
+            // and rebuilds this static cache, so the EnteredPlayMode event that would have closed a
+            // transition is never observed by the rebuilt instance. Deriving "is changing" from the
+            // live facts makes every snapshot self-correcting across that reload (and the exit-play
+            // reload) without depending on event delivery.
+            bool isPlaying = EditorApplication.isPlaying;
+            bool isChangingPlaymode = ComputeIsChangingPlaymode(isPlaying, EditorApplication.isPlayingOrWillChangePlaymode);
+
             var activityPhase = "idle";
             if (testsRunning)
             {
@@ -408,7 +417,7 @@ namespace MCPForUnity.Editor.Services
             {
                 activityPhase = "asset_import";
             }
-            else if (EditorApplication.isPlayingOrWillChangePlaymode)
+            else if (isChangingPlaymode)
             {
                 activityPhase = "playmode_transition";
             }
@@ -431,9 +440,9 @@ namespace MCPForUnity.Editor.Services
                     IsFocused = isFocused,
                     PlayMode = new EditorStatePlayMode
                     {
-                        IsPlaying = EditorApplication.isPlaying,
+                        IsPlaying = isPlaying,
                         IsPaused = EditorApplication.isPaused,
-                        IsChanging = EditorApplication.isPlayingOrWillChangePlaymode
+                        IsChanging = isChangingPlaymode
                     },
                     ActiveScene = new EditorStateActiveScene
                     {
@@ -527,6 +536,24 @@ namespace MCPForUnity.Editor.Services
 
                 return clone;
             }
+        }
+
+        /// <summary>
+        /// Determines whether the editor is mid play-mode transition purely from the two
+        /// EditorApplication facts, with no dependence on playModeStateChanged event continuity.
+        /// </summary>
+        /// <remarks>
+        /// <see cref="EditorApplication.isPlayingOrWillChangePlaymode"/> is true in BOTH stable play
+        /// and during a transition, so it cannot be used directly as an "is changing" signal. It only
+        /// diverges from <see cref="EditorApplication.isPlaying"/> on the transition edges:
+        /// entering play (isPlaying=false, willChange=true) and exiting play (isPlaying=true,
+        /// willChange=false). In stable edit (false/false) and stable play (true/true) they match.
+        /// This makes the function self-reconciling after the play-entry/exit domain reloads that
+        /// destroy the cache and drop the closing playModeStateChanged event.
+        /// </remarks>
+        internal static bool ComputeIsChangingPlaymode(bool isPlaying, bool isPlayingOrWillChangePlaymode)
+        {
+            return isPlaying != isPlayingOrWillChangePlaymode;
         }
 
         /// <summary>

@@ -280,6 +280,61 @@ namespace MCPForUnityTests.Editor.Services.Characterization
         }
 
         /// <summary>
+        /// Regression: the play-mode "is changing" signal must be reconciled from the two
+        /// EditorApplication facts, not taken from isPlayingOrWillChangePlaymode directly.
+        /// That property is true in BOTH stable play and during a transition, so trusting it
+        /// (combined with the play-entry domain reload dropping the EnteredPlayMode event) left
+        /// the snapshot reporting is_changing=true indefinitely while playing.
+        /// </summary>
+        [Test]
+        public void EditorStateCache_ComputeIsChangingPlaymode_ReconcilesFromFacts()
+        {
+            // Stable edit: not playing, not will-change -> not transitioning.
+            Assert.IsFalse(
+                EditorStateCache.ComputeIsChangingPlaymode(isPlaying: false, isPlayingOrWillChangePlaymode: false),
+                "Stable edit mode must report is_changing=false");
+
+            // Stable play: playing AND will-change both true -> NOT transitioning.
+            // This is the exact stuck case the bug produced.
+            Assert.IsFalse(
+                EditorStateCache.ComputeIsChangingPlaymode(isPlaying: true, isPlayingOrWillChangePlaymode: true),
+                "Stable play mode must report is_changing=false (regression: was stuck true)");
+
+            // Entering play edge: not yet playing but will change -> transitioning.
+            Assert.IsTrue(
+                EditorStateCache.ComputeIsChangingPlaymode(isPlaying: false, isPlayingOrWillChangePlaymode: true),
+                "Entering-play edge must report is_changing=true");
+
+            // Exiting play edge: still playing but will-change cleared -> transitioning.
+            Assert.IsTrue(
+                EditorStateCache.ComputeIsChangingPlaymode(isPlaying: true, isPlayingOrWillChangePlaymode: false),
+                "Exiting-play edge must report is_changing=true");
+        }
+
+        /// <summary>
+        /// Regression: a snapshot built in a non-transitioning editor must report is_changing=false
+        /// even though no playModeStateChanged event was ever delivered to this cache instance
+        /// (the batchmode EditMode run is exactly that situation — the static cache initialized fresh,
+        /// the editor sits in stable edit mode, and no play-mode event has fired). Before the fix the
+        /// phantom transition could persist; now the value is reconciled from live facts every build.
+        /// </summary>
+        [Test]
+        public void EditorStateCache_FreshSnapshot_NonTransitioning_ReportsIsChangingFalse()
+        {
+            Assert.IsFalse(EditorApplication.isPlaying, "Test precondition: editor is in edit mode");
+
+            var snapshot = EditorStateCache.GetSnapshot();
+            Assert.IsNotNull(snapshot, "Snapshot should be available");
+
+            bool isChanging = snapshot["editor"]?["play_mode"]?["is_changing"]?.ToObject<bool>() ?? true;
+            Assert.IsFalse(isChanging, "Stable edit-mode snapshot must report play_mode.is_changing=false");
+
+            string phase = snapshot["activity"]?["phase"]?.ToObject<string>();
+            Assert.AreNotEqual("playmode_transition", phase,
+                "Stable edit-mode snapshot must not report a playmode_transition phase");
+        }
+
+        /// <summary>
         /// Current behavior: EditorStateCache uses lock object for thread safety.
         /// </summary>
         [Test]
