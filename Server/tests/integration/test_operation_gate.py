@@ -13,9 +13,14 @@ Covers:
   fails open (MCPC-025).
 - Unknown classes (server and bridge) gate as mutate.
 - Busy shaping carries the blocking owner's display name.
+- Stale-transition fail-open: a transition-class blocking state that has
+  persisted past the stale ceiling stops parking calls (phantom-wedge
+  hardening); fresh transitions still park; running_tests is exempt;
+  ceiling is env-overridable.
 """
 
 import asyncio
+import logging
 import time
 import types
 
@@ -97,6 +102,7 @@ def _fresh_gate_state(monkeypatch):
     set_unity_instance_middleware(UnityInstanceMiddleware())
     # Force a registry-class refresh on first lookup in each test.
     monkeypatch.setattr(operation_gate, "_registry_last_refresh", 0.0)
+    operation_gate._stale_warn_last.clear()
     yield
     editor_state_cache.reset(ttl_s=0.5)
     set_unity_instance_middleware(UnityInstanceMiddleware())
@@ -361,6 +367,33 @@ class TestSharedStateCache:
         monkeypatch.setattr(edge, "recorded_at", time.monotonic() - 120.0)
         assert editor_state_cache.get_exclusive_edge_owner("inst") is None
 
+    def test_blocking_observation_accumulates_and_clears(self):
+        ages = editor_state_cache.observe_blocking_states("inst", ["compiling"])
+        assert ages["compiling"] == pytest.approx(0.0, abs=0.5)
+
+        # Backdate the record: continuously observed age accumulates.
+        record = editor_state_cache._blocking["inst"]["compiling"]
+        record.first_observed = time.monotonic() - 90.0
+        ages = editor_state_cache.observe_blocking_states("inst", ["compiling"])
+        assert ages["compiling"] == pytest.approx(90.0, abs=1.0)
+
+        # The reason clearing drops the record; recurrence starts fresh.
+        assert editor_state_cache.observe_blocking_states("inst", []) == {}
+        ages = editor_state_cache.observe_blocking_states("inst", ["compiling"])
+        assert ages["compiling"] == pytest.approx(0.0, abs=0.5)
+
+    def test_blocking_observation_reanchors_after_continuity_gap(self):
+        editor_state_cache.observe_blocking_states("inst", ["play_mode_transition"])
+        record = editor_state_cache._blocking["inst"]["play_mode_transition"]
+        # Nobody observed the state for a minute: it may have cleared and
+        # recurred unseen, so the age must not carry over.
+        record.first_observed = time.monotonic() - 300.0
+        record.last_observed = time.monotonic() - 60.0
+
+        ages = editor_state_cache.observe_blocking_states(
+            "inst", ["play_mode_transition"])
+        assert ages["play_mode_transition"] == pytest.approx(0.0, abs=0.5)
+
 
 # ----------------------------------------------------------------------
 # Compile fence (MCPC-025)
@@ -464,6 +497,217 @@ class TestCompileFence:
         result = await gate_for_class(ctx, CLASS_MUTATE, "manage_gameobject", "Game@hash-x")
 
         assert result is None  # mutations are not fenced
+
+
+# ----------------------------------------------------------------------
+# Stale-transition fail-open (phantom-wedge hardening)
+# ----------------------------------------------------------------------
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _play_changing_state(since_ms=None):
+    activity = {"phase": "playmode_transition"}
+    if since_ms is not None:
+        activity["since_unix_ms"] = since_ms
+    return {
+        "compilation": {},
+        "editor": {"play_mode": {"is_changing": True}},
+        "tests": {},
+        "activity": activity,
+    }
+
+
+class TestStaleTransitionFailOpen:
+    @pytest.mark.asyncio
+    async def test_stale_play_transition_fails_open(self, monkeypatch, caplog):
+        # Bridge claims the same transition has been running for 10 minutes —
+        # the live phantom-wedge shape. The gate must pass the call through
+        # immediately (no budget burn) and warn, naming the stale state.
+        fake = FakeEditorState(_play_changing_state(_now_ms() - 600_000))
+        _inject_state(monkeypatch, fake)
+
+        ctx = GateContext()
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING, logger="services.state.operation_gate"):
+            result = await gate_tool_call(
+                ctx, "manage_gameobject", {"action": "create"})
+
+        assert result is None
+        assert time.monotonic() - started < 2.0  # no full-budget park
+        warning = next(
+            rec for rec in caplog.records if "failing open" in rec.getMessage())
+        assert "play_mode_transition" in warning.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_fresh_play_transition_still_parks(self, monkeypatch):
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        fake = FakeEditorState(_play_changing_state(_now_ms()))
+        _inject_state(monkeypatch, fake)
+
+        ctx = GateContext()
+        result = await gate_tool_call(ctx, "manage_gameobject", {"action": "create"})
+
+        assert result is not None
+        assert result["success"] is False
+        assert result["data"]["reason"] == "play_mode_transition"
+
+    @pytest.mark.asyncio
+    async def test_stale_ceiling_env_override(self, monkeypatch):
+        # A tiny ceiling turns a fresh transition stale almost immediately:
+        # the gate parks briefly, crosses the ceiling, then fails open.
+        monkeypatch.setenv("UNITY_MCP_GATE_TRANSITION_STALE_S", "0.05")
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "5")
+        fake = FakeEditorState(_play_changing_state(_now_ms()))
+        _inject_state(monkeypatch, fake)
+
+        ctx = GateContext()
+        started = time.monotonic()
+        result = await gate_tool_call(ctx, "manage_gameobject", {"action": "create"})
+
+        assert result is None
+        assert time.monotonic() - started < 1.0  # ceiling, not budget
+
+    @pytest.mark.asyncio
+    async def test_observed_age_fails_open_without_bridge_since(self, monkeypatch):
+        # No activity section at all: only the server-side continuously
+        # observed age can detect the stuck flag.
+        monkeypatch.setenv("UNITY_MCP_GATE_TRANSITION_STALE_S", "0.1")
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "5")
+        fake = FakeEditorState(
+            {"compilation": {}, "editor": {"play_mode": {"is_changing": True}}, "tests": {}})
+        _inject_state(monkeypatch, fake)
+
+        ctx = GateContext()
+        started = time.monotonic()
+        result = await gate_tool_call(ctx, "manage_gameobject", {"action": "create"})
+
+        assert result is None
+        assert time.monotonic() - started < 1.0
+
+    @pytest.mark.asyncio
+    async def test_stale_compile_fails_open_via_compile_started(
+        self, monkeypatch, caplog,
+    ):
+        fake = FakeEditorState({
+            "compilation": {
+                "is_compiling": True,
+                "last_compile_started_unix_ms": _now_ms() - 600_000,
+            },
+        })
+        _inject_state(monkeypatch, fake)
+
+        ctx = GateContext()
+        with caplog.at_level(logging.WARNING, logger="services.state.operation_gate"):
+            result = await gate_tool_call(
+                ctx, "manage_gameobject", {"action": "create"})
+
+        assert result is None
+        warning = next(
+            rec for rec in caplog.records if "failing open" in rec.getMessage())
+        assert "compiling" in warning.getMessage()
+
+    @pytest.mark.asyncio
+    async def test_completed_compile_timestamp_not_treated_as_current(self, monkeypatch):
+        # started/finished pair belongs to a *previous* compile; the stuck
+        # is_compiling flag has only just been observed — still parks.
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        fake = FakeEditorState({
+            "compilation": {
+                "is_compiling": True,
+                "last_compile_started_unix_ms": _now_ms() - 600_000,
+                "last_compile_finished_unix_ms": _now_ms() - 300_000,
+            },
+        })
+        _inject_state(monkeypatch, fake)
+
+        ctx = GateContext()
+        result = await gate_tool_call(ctx, "manage_gameobject", {"action": "create"})
+
+        assert result is not None
+        assert result["data"]["reason"] == "compiling"
+
+    @pytest.mark.asyncio
+    async def test_running_tests_exempt_from_stale_ceiling(self, monkeypatch):
+        # A test run that started an hour ago is a legitimate long-lived
+        # session, not a phantom — exclusive calls still park to busy.
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        fake = FakeEditorState({
+            "tests": {
+                "is_running": True,
+                "started_by": "Aurora",
+                "started_unix_ms": _now_ms() - 3_600_000,
+            },
+            "activity": {
+                "phase": "running_tests",
+                "since_unix_ms": _now_ms() - 3_600_000,
+            },
+        })
+        _inject_state(monkeypatch, fake)
+        _no_fence(monkeypatch)
+
+        ctx = GateContext()
+        result = await gate_tool_call(ctx, "refresh_unity", {})
+
+        assert result is not None
+        assert result["data"]["reason"] == "running_tests"
+
+    @pytest.mark.asyncio
+    async def test_stale_state_skipped_but_fresh_state_still_parks(
+        self, monkeypatch, caplog,
+    ):
+        # Stale compile is ignored, but the fresh play transition in the same
+        # snapshot still parks — staleness is judged per reason.
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        fake = FakeEditorState({
+            "compilation": {
+                "is_compiling": True,
+                "last_compile_started_unix_ms": _now_ms() - 600_000,
+            },
+            "editor": {"play_mode": {"is_changing": True}},
+            "activity": {
+                "phase": "playmode_transition",
+                "since_unix_ms": _now_ms(),
+            },
+        })
+        _inject_state(monkeypatch, fake)
+
+        ctx = GateContext()
+        with caplog.at_level(logging.WARNING, logger="services.state.operation_gate"):
+            result = await gate_tool_call(
+                ctx, "manage_gameobject", {"action": "create"})
+
+        assert result is not None
+        assert result["data"]["reason"] == "play_mode_transition"
+        assert any("compiling" in rec.getMessage() and "failing open" in rec.getMessage()
+                   for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_nonpositive_ceiling_disables_stale_fail_open(self, monkeypatch):
+        monkeypatch.setenv("UNITY_MCP_GATE_TRANSITION_STALE_S", "0")
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        fake = FakeEditorState(_play_changing_state(_now_ms() - 600_000))
+        _inject_state(monkeypatch, fake)
+
+        ctx = GateContext()
+        result = await gate_tool_call(ctx, "manage_gameobject", {"action": "create"})
+
+        assert result is not None
+        assert result["data"]["reason"] == "play_mode_transition"
+
+    @pytest.mark.asyncio
+    async def test_invalid_ceiling_env_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("UNITY_MCP_GATE_TRANSITION_STALE_S", "not-a-number")
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        fake = FakeEditorState(_play_changing_state(_now_ms()))
+        _inject_state(monkeypatch, fake)
+
+        ctx = GateContext()
+        result = await gate_tool_call(ctx, "manage_gameobject", {"action": "create"})
+
+        # Default 120s ceiling: a fresh transition still parks to busy.
+        assert result is not None
+        assert result["data"]["reason"] == "play_mode_transition"
 
 
 # ----------------------------------------------------------------------

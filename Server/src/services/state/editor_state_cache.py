@@ -11,6 +11,15 @@ through a declared exclusive tool or detected post-hoc after arbitrary-code
 execution — the session's display name is recorded here so later parked calls
 can attribute the busy state to its owner.
 
+It additionally tracks *blocking-state persistence*: for each instance, how
+long the same blocking editor condition (compiling, domain-reload pending,
+play-mode transition) has been continuously observed by gate polls. A record
+re-anchors to "now" when continuity lapses (no observation within
+``BLOCKING_CONTINUITY_WINDOW_SECONDS`` — the state may have cleared and
+recurred unseen) and is dropped the moment a poll sees the reason inactive.
+The gate uses these ages, alongside the bridge-reported state-start
+timestamps, to detect phantom transitions that never end.
+
 Everything fails open: a fetch error behaves as "no snapshot", and callers
 must treat a ``None`` snapshot as permission to proceed.
 """
@@ -20,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,6 +51,13 @@ FETCH_TIMEOUT_SECONDS = 5.0
 # Exclusive-edge ownership records expire on their own; there is no cleanup.
 EDGE_TTL_SECONDS = 30.0
 
+# Maximum gap between observations of the same blocking reason for the
+# persistence record to stay continuous. Parked calls poll on a sub-second
+# cadence and busy-retry loops re-poll within ~1s, so anything beyond this
+# means nobody was watching — the state may have cleared and recurred unseen,
+# and the record re-anchors rather than over-counting.
+BLOCKING_CONTINUITY_WINDOW_SECONDS = 10.0
+
 
 @dataclass
 class _CacheEntry:
@@ -55,6 +72,12 @@ class _ExclusiveEdge:
     recorded_at: float  # time.monotonic()
 
 
+@dataclass
+class _BlockingObservation:
+    first_observed: float  # time.monotonic()
+    last_observed: float  # time.monotonic()
+
+
 def _instance_key(unity_instance: str | None) -> str:
     return unity_instance or "default"
 
@@ -66,11 +89,13 @@ class EditorStateCache:
         self._ttl_s = float(ttl_s)
         self._entries: dict[str, _CacheEntry] = {}
         self._edges: dict[str, _ExclusiveEdge] = {}
+        self._blocking: dict[str, dict[str, _BlockingObservation]] = {}
 
     def reset(self, ttl_s: float | None = None) -> None:
         """Clear all cached state (test seam)."""
         self._entries.clear()
         self._edges.clear()
+        self._blocking.clear()
         if ttl_s is not None:
             self._ttl_s = float(ttl_s)
 
@@ -163,6 +188,55 @@ class EditorStateCache:
             self._edges.pop(key, None)
             return None
         return edge.owner
+
+    # ------------------------------------------------------------------
+    # Blocking-state persistence (phantom-transition detection support)
+    # ------------------------------------------------------------------
+    def observe_blocking_states(
+        self,
+        unity_instance: str | None,
+        active_reasons: Iterable[str],
+    ) -> dict[str, float]:
+        """Update persistence records from one gate poll; return ages.
+
+        ``active_reasons`` is the set of blocking reasons the current snapshot
+        shows for the instance. Active reasons accumulate continuously
+        observed age (seconds since first observation, re-anchored when the
+        continuity window lapses); reasons absent from the set are forgotten,
+        so a state that clears and later recurs starts a fresh record.
+        """
+        key = _instance_key(unity_instance)
+        now = time.monotonic()
+        active = set(active_reasons)
+        records = self._blocking.get(key)
+        if records is None:
+            if not active:
+                return {}
+            records = {}
+            self._blocking[key] = records
+
+        for reason in list(records):
+            if reason not in active:
+                del records[reason]
+
+        ages: dict[str, float] = {}
+        for reason in active:
+            observation = records.get(reason)
+            if (
+                observation is None
+                or (now - observation.last_observed) > BLOCKING_CONTINUITY_WINDOW_SECONDS
+            ):
+                observation = _BlockingObservation(
+                    first_observed=now, last_observed=now
+                )
+                records[reason] = observation
+            else:
+                observation.last_observed = now
+            ages[reason] = now - observation.first_observed
+
+        if not records:
+            self._blocking.pop(key, None)
+        return ages
 
 
 # Global singleton (simple, process-local) — same pattern as

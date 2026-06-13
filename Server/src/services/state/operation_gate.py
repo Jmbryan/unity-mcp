@@ -27,6 +27,39 @@ Gate decisions read one shared, cached editor-state source
 (``editor_state_cache``) — never per-call polling fan-out — and every failure
 path fails open: a cache miss, ledger error, or internal exception lets the
 call proceed.
+
+Stale-transition fail-open (phantom-wedge hardening)
+----------------------------------------------------
+A bridge that misses a state-change event can report a blocking condition
+forever (e.g. ``play_mode.is_changing: true`` with ``activity.phase:
+"playmode_transition"`` frozen) — without a ceiling, every non-read call
+parks to its full budget on a transition that will never end. The design's
+intent (bounded waits, never indefinite wedges) is enforced as follows:
+
+- The *transition-class* blocking reasons — ``compiling``, ``domain_reload``,
+  ``play_mode_transition`` — are states the editor passes *through*; none of
+  them legitimately persists for minutes as the same episode. When the SAME
+  blocking reason has persisted beyond the stale ceiling (default
+  ``120s``, override via ``UNITY_MCP_GATE_TRANSITION_STALE_S``; values <= 0
+  disable the check), the gate stops parking on it: it logs a warning naming
+  the stale state and fails open. Other, still-fresh blocking conditions in
+  the same snapshot continue to park.
+- Persistence is measured as the max of two signals: the bridge's own
+  state-start claim (``activity.since_unix_ms`` when ``activity.phase``
+  matches the reason; ``compilation.last_compile_started_unix_ms`` for an
+  unfinished compile) and the server-side continuously-observed age tracked
+  by ``editor_state_cache``. The bridge timestamp catches a frozen wedge
+  immediately even on the first observation (e.g. after a server restart);
+  the server-side age catches inconsistent snapshots whose ``since`` keeps
+  refreshing while the flag stays stuck. A genuinely fresh transition is
+  young on both signals and parks as before — the check never weakens
+  ordinary parking.
+- ``running_tests`` is deliberately exempt: a test run is a long-lived
+  session whose ``started_unix_ms`` is legitimately frozen for its entire
+  (possibly 10+ minute) duration, and exclusive calls parked behind it are
+  already bounded per call by the park budget's busy conversion.
+- The edit fence needs no ceiling: its hot window is inherently
+  freshness-based and entries quiesce on their own.
 """
 
 from __future__ import annotations
@@ -73,6 +106,30 @@ MAX_PARK_BUDGET_SECONDS = 20.0
 
 # Heartbeat cadence while parked.
 _HEARTBEAT_INTERVAL_SECONDS = 1.0
+
+# Stale-transition ceiling (seconds): a transition-class blocking state that
+# has persisted this long as the same episode is a phantom — fail open. See
+# the module docstring for the full semantics.
+DEFAULT_TRANSITION_STALE_CEILING_SECONDS = 120.0
+TRANSITION_STALE_ENV_VAR = "UNITY_MCP_GATE_TRANSITION_STALE_S"
+
+# Blocking reasons subject to the stale ceiling (transition-class states the
+# editor passes through). running_tests is exempt — see module docstring.
+_STALE_CEILING_REASONS = frozenset(
+    {"compiling", "domain_reload", "play_mode_transition"}
+)
+
+# Bridge activity.phase value corresponding to each blocking reason, for
+# reading activity.since_unix_ms as the state-start claim.
+_ACTIVITY_PHASE_BY_REASON = {
+    "compiling": "compiling",
+    "domain_reload": "domain_reload",
+    "play_mode_transition": "playmode_transition",
+}
+
+# Throttle for stale-fail-open warnings, keyed by (instance, reason).
+_STALE_WARN_INTERVAL_SECONDS = 30.0
+_stale_warn_last: dict[tuple[str, str], float] = {}
 
 # Per-argument classification overrides for tools whose class depends on the
 # requested action (MCPC-005's argument-inspecting table). Tool name ->
@@ -258,6 +315,23 @@ def _fence_window_s() -> float:
     return max(0.0, min(value, 30.0))
 
 
+def _transition_stale_ceiling_s() -> float:
+    """Stale-transition ceiling in seconds; values <= 0 disable the check."""
+    raw = os.environ.get(TRANSITION_STALE_ENV_VAR)
+    if raw is None:
+        return DEFAULT_TRANSITION_STALE_CEILING_SECONDS
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r, using default %.1f",
+            TRANSITION_STALE_ENV_VAR,
+            raw,
+            DEFAULT_TRANSITION_STALE_CEILING_SECONDS,
+        )
+        return DEFAULT_TRANSITION_STALE_CEILING_SECONDS
+
+
 def _poll_sleep_s() -> float:
     try:
         from core.config import config
@@ -271,6 +345,75 @@ def _poll_sleep_s() -> float:
 # ----------------------------------------------------------------------
 # Blocking checks
 # ----------------------------------------------------------------------
+def _bridge_state_started_unix_ms(state: dict[str, Any], reason: str) -> int | None:
+    """Bridge-reported start timestamp (unix ms) of a blocking state, if any."""
+    if reason == "compiling":
+        compilation = state.get("compilation") or {}
+        started = compilation.get("last_compile_started_unix_ms")
+        finished = compilation.get("last_compile_finished_unix_ms")
+        if isinstance(started, (int, float)) and started > 0:
+            # Only meaningful for the *current* compile: a finish at or after
+            # the start means the timestamp belongs to a completed compile.
+            if not (isinstance(finished, (int, float)) and finished >= started):
+                return int(started)
+    activity = state.get("activity") or {}
+    phase = activity.get("phase")
+    expected_phase = _ACTIVITY_PHASE_BY_REASON.get(reason)
+    if (
+        isinstance(phase, str)
+        and expected_phase is not None
+        and phase.strip().lower() == expected_phase
+    ):
+        since = activity.get("since_unix_ms")
+        if isinstance(since, (int, float)) and since > 0:
+            return int(since)
+    return None
+
+
+def _stale_block_age_s(
+    state: dict[str, Any],
+    reason: str,
+    observed_age_s: float,
+) -> float:
+    """Seconds the same blocking state has persisted (max of both signals).
+
+    The bridge state-start claim catches a frozen wedge immediately; the
+    server-side continuously-observed age catches snapshots whose ``since``
+    keeps refreshing while the flag stays stuck.
+    """
+    age = max(0.0, observed_age_s)
+    started_ms = _bridge_state_started_unix_ms(state, reason)
+    if started_ms is not None:
+        bridge_age = time.time() - (started_ms / 1000.0)
+        if bridge_age > age:
+            age = bridge_age
+    return age
+
+
+def _warn_stale_fail_open(
+    unity_instance: str | None,
+    reason: str,
+    age_s: float,
+    ceiling_s: float,
+) -> None:
+    """Throttled warning naming the stale blocking state being ignored."""
+    key = (unity_instance or "default", reason)
+    now = time.monotonic()
+    last = _stale_warn_last.get(key, 0.0)
+    if now - last < _STALE_WARN_INTERVAL_SECONDS:
+        return
+    _stale_warn_last[key] = now
+    logger.warning(
+        "operation_gate: blocking state '%s' on instance '%s' has persisted "
+        "%.0fs (stale ceiling %.0fs) — suspected phantom transition; failing "
+        "open instead of parking",
+        reason,
+        unity_instance or "default",
+        age_s,
+        ceiling_s,
+    )
+
+
 def _editor_block(
     state: dict[str, Any] | None,
     concurrency_class: str,
@@ -278,7 +421,10 @@ def _editor_block(
 ) -> tuple[str, str | None] | None:
     """(reason, owner) when the editor state blocks this class, else None.
 
-    A missing snapshot (cache miss) never blocks — the gate fails open.
+    A missing snapshot (cache miss) never blocks — the gate fails open. A
+    transition-class blocking state that has persisted past the stale ceiling
+    is skipped (fail open, with a warning); fresher blocking states in the
+    same snapshot still park.
     """
     if not isinstance(state, dict):
         return None
@@ -290,17 +436,38 @@ def _editor_block(
 
     edge_owner = editor_state_cache.get_exclusive_edge_owner(unity_instance)
 
+    candidates: list[tuple[str, str | None]] = []
     if compilation.get("is_compiling") is True:
-        return ("compiling", edge_owner)
+        candidates.append(("compiling", edge_owner))
     if compilation.get("is_domain_reload_pending") is True:
-        return ("domain_reload", edge_owner)
+        candidates.append(("domain_reload", edge_owner))
     if play_mode.get("is_changing") is True:
-        return ("play_mode_transition", edge_owner)
+        candidates.append(("play_mode_transition", edge_owner))
     # Test runs park only compile-class (exclusive) operations: script state
     # on disk cannot affect an in-flight run until a recompile picks it up.
     if tests.get("is_running") is True and concurrency_class == CLASS_EXCLUSIVE:
         owner = tests.get("started_by")
-        return ("running_tests", owner if isinstance(owner, str) and owner else edge_owner)
+        candidates.append(
+            ("running_tests", owner if isinstance(owner, str) and owner else edge_owner)
+        )
+
+    # Track how long each transition-class reason has been continuously
+    # observed (also clears records for reasons no longer present).
+    active_ceiling_reasons = [
+        reason for reason, _ in candidates if reason in _STALE_CEILING_REASONS
+    ]
+    observed_ages = editor_state_cache.observe_blocking_states(
+        unity_instance, active_ceiling_reasons
+    )
+
+    ceiling = _transition_stale_ceiling_s()
+    for reason, owner in candidates:
+        if ceiling > 0 and reason in _STALE_CEILING_REASONS:
+            age = _stale_block_age_s(state, reason, observed_ages.get(reason, 0.0))
+            if age >= ceiling:
+                _warn_stale_fail_open(unity_instance, reason, age, ceiling)
+                continue
+        return (reason, owner)
     return None
 
 
