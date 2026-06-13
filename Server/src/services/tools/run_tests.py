@@ -25,6 +25,24 @@ logger = logging.getLogger(__name__)
 _background_tasks: set[asyncio.Task] = set()
 
 
+def _note_test_job_status(
+    unity_instance: str | None,
+    job_id: str | None,
+    status: str | None,
+) -> None:
+    """Feed an observed test-job status to the ownership store (fail-open).
+
+    Renews the owner's inactivity TTL on a live poll and frees ownership when
+    the job reaches a terminal status, so a later non-owner clear is unguarded.
+    """
+    try:
+        from services.state.test_job_lease import note_status_observed
+
+        note_status_observed(unity_instance, job_id, status)
+    except Exception as exc:
+        logger.debug("run_tests: test-job status observation skipped: %r", exc)
+
+
 async def _get_unity_project_path(unity_instance: str | None) -> str | None:
     """Get the project root path for a Unity instance (for focus nudging).
 
@@ -171,11 +189,40 @@ async def run_tests(
     init_timeout: Annotated[int | None,
                             "Initialization timeout in milliseconds. PlayMode tests may need longer "
                             "due to domain reload (default: 15000). Recommended: 120000 for PlayMode."] = None,
+    clear_stuck: Annotated[bool,
+                           "Force-clear the editor's current (stuck or orphaned) test job instead of "
+                           "starting a run. Owner-only while another session owns the running job."] = False,
 ) -> RunTestsStartResponse | MCPResponse:
+    unity_instance = await get_unity_instance_from_context(ctx)
+
+    # Abort/clear surface (MCPC-022): clearing the editor's running job is the
+    # only call that cancels another session's test run. It is owner-only — a
+    # non-owner receives a structured busy result naming the owner; an unknown
+    # or expired job fails open.
+    if clear_stuck:
+        from services.state.test_job_lease import (
+            enforce_clear_ownership,
+            test_job_lease_manager,
+        )
+
+        busy = await enforce_clear_ownership(ctx, unity_instance)
+        if busy is not None:
+            return MCPResponse(**busy)
+
+        response = await unity_transport.send_with_unity_instance(
+            async_send_command_with_retry,
+            unity_instance,
+            "run_tests",
+            {"clear_stuck": True},
+        )
+        # The job (if any) is gone; drop ownership regardless of outcome.
+        test_job_lease_manager.release(unity_instance, reason="cleared")
+        if isinstance(response, dict):
+            return MCPResponse(**response)
+        return MCPResponse(success=False, error=str(response))
+
     if init_timeout is not None and init_timeout <= 0:
         return MCPResponse(success=False, error="init_timeout must be a positive integer (milliseconds) or None")
-
-    unity_instance = await get_unity_instance_from_context(ctx)
 
     gate = await preflight(ctx, requires_no_tests=True, wait_for_no_compile=True, refresh_if_dirty=True)
     if isinstance(gate, MCPResponse):
@@ -217,7 +264,13 @@ async def run_tests(
     if isinstance(response, dict):
         if not response.get("success", True):
             return MCPResponse(**response)
-        return RunTestsStartResponse(**response)
+        start = RunTestsStartResponse(**response)
+        # Record the initiating session as the owner of this job (MCPC-022).
+        if start.success and start.data is not None and start.data.job_id:
+            from services.state.test_job_lease import record_started_job
+
+            await record_started_job(ctx, unity_instance, start.data.job_id)
+        return start
     return MCPResponse(success=False, error=str(response))
 
 
@@ -279,6 +332,8 @@ async def get_test_job(
             # Check if tests are done
             data = response.get("data", {})
             status = data.get("status", "")
+            # Renew owner activity on a live poll; free ownership on completion.
+            _note_test_job_status(unity_instance, job_id, status)
             if status in ("succeeded", "failed", "cancelled"):
                 return GetTestJobResponse(**response)
 
@@ -335,6 +390,7 @@ async def get_test_job(
     # detected regardless of polling style.
     data = response.get("data", {})
     status = data.get("status", "")
+    _note_test_job_status(unity_instance, job_id, status)
     if status == "running":
         progress = data.get("progress") or {}
         editor_is_focused = progress.get("editor_is_focused", True)
