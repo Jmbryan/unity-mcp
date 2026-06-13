@@ -8,6 +8,7 @@ using UnityEditor;
 using UnityEngine;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
+using MCPForUnity.Editor.Services;
 using System.Threading;
 using System.Security.Cryptography;
 
@@ -786,12 +787,15 @@ namespace MCPForUnity.Editor.Tools
                 if (immediate)
                 {
                     McpLog.Info($"[ManageScript] ApplyTextEdits: immediate refresh for '{relativePath}'");
+#if UNITY_EDITOR
+                    // Defer funnel: synchronous import lands the edit on disk now; the compile request
+                    // is held while play mode or a test run is active and flushes on return to idle.
+                    Services.DeferredCompileService.ImportAndRequestCompile(relativePath, synchronous: true);
+#else
                     AssetDatabase.ImportAsset(
                         relativePath,
                         ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate
                     );
-#if UNITY_EDITOR
-                    UnityEditor.Compilation.CompilationPipeline.RequestScriptCompilation();
 #endif
                 }
                 else
@@ -2978,13 +2982,26 @@ namespace MCPForUnity.Editor.Tools
             {
                 string[] toImport;
                 lock (_lock) { toImport = _paths.ToArray(); _paths.Clear(); }
+#if UNITY_EDITOR
+                // Route every import through the defer funnel. Importing a script is itself a compile
+                // trigger, so while play mode / a test run is active the funnel holds the import (the
+                // disk write already landed) and flushes it on return to idle. When idle it imports and
+                // compiles immediately.
+                foreach (var p in toImport)
+                {
+                    var sp = ManageScriptRefreshHelpers.SanitizeAssetsPath(p);
+                    Services.DeferredCompileService.ImportAndRequestCompile(sp, synchronous: true);
+                }
+                if (toImport.Length == 0)
+                {
+                    Services.DeferredCompileService.RequestCompile("debounced_refresh");
+                }
+#else
                 foreach (var p in toImport)
                 {
                     var sp = ManageScriptRefreshHelpers.SanitizeAssetsPath(p);
                     AssetDatabase.ImportAsset(sp, ImportAssetOptions.ForceUpdate | ImportAssetOptions.ForceSynchronousImport);
                 }
-#if UNITY_EDITOR
-                UnityEditor.Compilation.CompilationPipeline.RequestScriptCompilation();
 #endif
                 // Fallback if needed:
                 // AssetDatabase.Refresh();
@@ -3016,12 +3033,9 @@ namespace MCPForUnity.Editor.Tools
         public static void ImportAndRequestCompile(string relPath, bool synchronous = true)
         {
             var sp = SanitizeAssetsPath(relPath);
-            var opts = ImportAssetOptions.ForceUpdate;
-            if (synchronous) opts |= ImportAssetOptions.ForceSynchronousImport;
-            AssetDatabase.ImportAsset(sp, opts);
-#if UNITY_EDITOR
-            UnityEditor.Compilation.CompilationPipeline.RequestScriptCompilation();
-#endif
+            // Defer funnel: imports the asset (always, synchronously when requested) and holds the
+            // compile request while play mode or a test run is active, flushing on return to idle.
+            Services.DeferredCompileService.ImportAndRequestCompile(sp, synchronous);
         }
     }
 }

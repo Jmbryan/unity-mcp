@@ -5,7 +5,6 @@ using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
-using UnityEditor.Compilation;
 
 namespace MCPForUnity.Editor.Tools
 {
@@ -25,17 +24,9 @@ namespace MCPForUnity.Editor.Tools
             string compile = @params?["compile"]?.ToString() ?? "none";
             bool waitForReady = ParamCoercion.CoerceBool(@params?["wait_for_ready"], false);
 
-            if (TestRunStatus.IsRunning)
-            {
-                return new ErrorResponse("tests_running", new
-                {
-                    reason = "tests_running",
-                    retry_after_ms = 5000
-                });
-            }
-
             bool refreshTriggered = false;
             bool compileRequested = false;
+            bool compileDeferred = false;
 
             try
             {
@@ -59,7 +50,10 @@ namespace MCPForUnity.Editor.Tools
 
                 if (string.Equals(compile, "request", StringComparison.OrdinalIgnoreCase))
                 {
-                    CompilationPipeline.RequestScriptCompilation();
+                    // Defer-don't-error: route through the funnel. Fires immediately when idle; while
+                    // play mode or a test run is active it records a pending request that flushes on
+                    // return to idle. Replaces the former tests_running hard error.
+                    compileDeferred = DeferredCompileService.RequestCompile("refresh_unity");
                     compileRequested = true;
                 }
 
@@ -85,7 +79,9 @@ namespace MCPForUnity.Editor.Tools
 #if UNITY_6000_0_OR_NEWER
             bool shouldWaitForReady = waitForReady && !compileRequested;
 #else
-            bool shouldWaitForReady = waitForReady;
+            // Never block on readiness when the compile was deferred — nothing will run until the
+            // blocking play/test span ends, so the wait would only time out.
+            bool shouldWaitForReady = waitForReady && !compileDeferred;
 #endif
             if (shouldWaitForReady)
             {
@@ -117,10 +113,13 @@ namespace MCPForUnity.Editor.Tools
             {
                 refresh_triggered = refreshTriggered,
                 compile_requested = compileRequested,
+                compile_deferred = compileDeferred,
                 resulting_state = resultingState,
-                hint = shouldWaitForReady
-                    ? "Unity refresh completed; editor should be ready."
-                    : "If Unity enters compilation/domain reload, poll editor_state until ready_for_tools is true."
+                hint = compileDeferred
+                    ? "Compile deferred while play mode / a test run is active; it will flush automatically on return to idle. Poll editor_state.compilation.deferred_compile_pending."
+                    : (shouldWaitForReady
+                        ? "Unity refresh completed; editor should be ready."
+                        : "If Unity enters compilation/domain reload, poll editor_state until ready_for_tools is true.")
             });
         }
 

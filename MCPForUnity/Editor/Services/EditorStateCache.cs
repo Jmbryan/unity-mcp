@@ -165,6 +165,14 @@ namespace MCPForUnity.Editor.Services
 
             [JsonProperty("last_domain_reload_after_unix_ms")]
             public long? LastDomainReloadAfterUnixMs { get; set; }
+
+            // MCPC-020: deferred-compile visibility. True while a compile request is held because play
+            // mode or a test run is active; reason is the recorded source of the held request.
+            [JsonProperty("deferred_compile_pending")]
+            public bool? DeferredCompilePending { get; set; }
+
+            [JsonProperty("deferred_compile_reason")]
+            public string DeferredCompileReason { get; set; }
         }
 
         private sealed class EditorStateAssets
@@ -464,7 +472,9 @@ namespace MCPForUnity.Editor.Services
                     LastCompileStartedUnixMs = _lastCompileStartedUnixMs,
                     LastCompileFinishedUnixMs = _lastCompileFinishedUnixMs,
                     LastDomainReloadBeforeUnixMs = _domainReloadBeforeUnixMs,
-                    LastDomainReloadAfterUnixMs = _domainReloadAfterUnixMs
+                    LastDomainReloadAfterUnixMs = _domainReloadAfterUnixMs,
+                    DeferredCompilePending = DeferredCompileService.HasPendingCompile,
+                    DeferredCompileReason = DeferredCompileService.PendingReason
                 },
                 Assets = new EditorStateAssets
                 {

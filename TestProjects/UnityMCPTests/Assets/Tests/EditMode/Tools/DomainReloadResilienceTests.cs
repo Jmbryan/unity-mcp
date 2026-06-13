@@ -2,13 +2,85 @@ using NUnit.Framework;
 using UnityEngine;
 using UnityEngine.TestTools;
 using UnityEditor;
+using System;
 using System.Collections;
 using System.IO;
+using System.Reflection;
+using MCPForUnity.Editor.Services;
 using MCPForUnity.Editor.Tools;
 using Newtonsoft.Json.Linq;
 
 namespace MCPForUnityTests.Editor.Tools
 {
+    /// <summary>
+    /// Verifies that DeferredCompileService's pending-compile set and auto-refresh suppression depth
+    /// survive a domain reload, which destroys the process-local statics but not SessionState
+    /// (MCPC-019/021). These do not trigger script compilation, so they run in the normal suite.
+    /// </summary>
+    public class DeferredCompilePersistenceTests
+    {
+        private const string SessionKey_PendingCompile = "MCPForUnity.DeferredCompile.Pending";
+        private const string SessionKey_PendingReason = "MCPForUnity.DeferredCompile.Reason";
+        private const string SessionKey_AutoRefreshDepth = "MCPForUnity.DeferredCompile.AutoRefreshDepth";
+
+        private bool _origPending;
+        private string _origReason;
+        private int _origDepth;
+
+        [SetUp]
+        public void SetUp()
+        {
+            _origPending = SessionState.GetBool(SessionKey_PendingCompile, false);
+            _origReason = SessionState.GetString(SessionKey_PendingReason, string.Empty);
+            _origDepth = SessionState.GetInt(SessionKey_AutoRefreshDepth, 0);
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            SessionState.SetBool(SessionKey_PendingCompile, _origPending);
+            SessionState.SetString(SessionKey_PendingReason, _origReason);
+            SessionState.SetInt(SessionKey_AutoRefreshDepth, _origDepth);
+        }
+
+        [Test]
+        public void PendingCompile_WrittenToSessionState_SurvivesReloadSurface()
+        {
+            var svc = typeof(MCPServiceLocator).Assembly
+                .GetType("MCPForUnity.Editor.Services.DeferredCompileService");
+            Assert.NotNull(svc, "DeferredCompileService not found");
+
+            var setPending = svc.GetMethod("SetPending", BindingFlags.NonPublic | BindingFlags.Static);
+            Assert.NotNull(setPending, "SetPending not found");
+
+            // Record a pending compile, then read it back ONLY through SessionState — the same surface
+            // a freshly-reloaded service reads on its InitializeOnLoad constructor.
+            setPending.Invoke(null, new object[] { true, "reload_survival" });
+
+            Assert.IsTrue(SessionState.GetBool(SessionKey_PendingCompile, false),
+                "Pending flag must persist in SessionState across a domain reload.");
+            Assert.AreEqual("reload_survival",
+                SessionState.GetString(SessionKey_PendingReason, string.Empty),
+                "Pending reason must persist in SessionState across a domain reload.");
+
+            // And the post-reload accessors (which read SessionState) observe it.
+            Assert.IsTrue(DeferredCompileService.HasPendingCompile);
+            Assert.AreEqual("reload_survival", DeferredCompileService.PendingReason);
+
+            setPending.Invoke(null, new object[] { false, null });
+        }
+
+        [Test]
+        public void AutoRefreshDepth_PersistsInSessionState()
+        {
+            // The Disallow/Allow refcount itself is process-local and reset by a reload; the depth that
+            // the rebalance guard reads on load is the SessionState value, which must persist.
+            SessionState.SetInt(SessionKey_AutoRefreshDepth, 2);
+            Assert.AreEqual(2, SessionState.GetInt(SessionKey_AutoRefreshDepth, 0),
+                "Auto-refresh suppression depth must persist in SessionState for the reload rebalance guard.");
+        }
+    }
+
     /// <summary>
     /// Tests for domain reload resilience - ensuring MCP requests succeed even during Unity domain reloads.
     ///

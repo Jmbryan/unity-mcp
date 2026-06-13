@@ -54,6 +54,9 @@ class EditorStateCompilation(BaseModel):
     last_compile_finished_unix_ms: int | None = None
     last_domain_reload_before_unix_ms: int | None = None
     last_domain_reload_after_unix_ms: int | None = None
+    # MCPC-020: deferred-compile visibility (additive; schema stays unity-mcp/editor_state@2).
+    deferred_compile_pending: bool | None = None
+    deferred_compile_reason: str | None = None
 
 
 class EditorStateRefresh(BaseModel):
