@@ -4,9 +4,13 @@ Middleware for managing Unity instance selection per session.
 This middleware intercepts all tool calls and injects the active Unity instance
 into the request-scoped state, allowing tools to access it via ctx.get_state("unity_instance").
 """
+from collections import deque
 from dataclasses import dataclass
 from threading import RLock
+import hashlib
+import json
 import logging
+import os
 import time
 
 from fastmcp.server.middleware import Middleware, MiddlewareContext
@@ -62,6 +66,23 @@ _IDENTITY_COLORS: tuple[str, ...] = (
     "#C678DD", "#56B6C2", "#D19A66", "#7F9F7F",
 )
 
+# Loop-detection window (seconds) for the `looping` rabbit-hole flag (MCPC-032:
+# "same tool + args-hash >=5x in 10 min"). Env-overridable; the ring buffer is
+# bounded so a busy session never grows it without limit.
+_DEFAULT_LOOP_WINDOW_SECONDS = 600.0
+_LOOP_RING_MAXLEN = 200
+
+
+def _loop_window_s() -> float:
+    raw = os.environ.get("UNITY_MCP_LOOP_WINDOW_S")
+    if raw is None:
+        return _DEFAULT_LOOP_WINDOW_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_LOOP_WINDOW_SECONDS
+    return max(1.0, value)
+
 
 @dataclass
 class SessionIdentity:
@@ -99,6 +120,9 @@ class UnityInstanceMiddleware(Middleware):
         # _active_by_key. Never evicted: lives for the server process lifetime.
         self._identity_by_key: dict[str, SessionIdentity] = {}
         self._identity_counter = 0
+        # Recent tool-call signatures per session key, for the rabbit-hole
+        # `looping` flag (MCPC-032): (signature, monotonic_ts) pairs, bounded.
+        self._recent_tool_calls: dict[str, deque[tuple[str, float]]] = {}
         self._lock = RLock()
         self._metadata_lock = RLock()
         self._unity_managed_tool_names: set[str] = set()
@@ -193,6 +217,78 @@ class UnityInstanceMiddleware(Middleware):
         """Return the sticky identity for the calling session."""
         key = await self.get_session_key(ctx)
         return self.ensure_session_identity_for_key(key)
+
+    def all_session_identities(self) -> list[SessionIdentity]:
+        """Snapshot of every assigned session identity (roster source)."""
+        with self._lock:
+            return list(self._identity_by_key.values())
+
+    # ------------------------------------------------------------------
+    # Recent tool-call signatures (rabbit-hole `looping` flag, MCPC-032)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _tool_call_signature(tool_name: str, arguments: Any) -> str:
+        """Stable hash of tool name + canonicalized arguments."""
+        try:
+            args_repr = json.dumps(arguments, sort_keys=True, default=str)
+        except Exception:
+            args_repr = repr(arguments)
+        digest = hashlib.sha1(args_repr.encode("utf-8", "replace")).hexdigest()[:12]
+        return f"{tool_name}:{digest}"
+
+    def record_tool_call_signature(
+        self, key: str, tool_name: str | None, arguments: Any
+    ) -> None:
+        """Append a tool call's signature to the session's recent ring buffer.
+
+        Bounded by count and pruned to the loop-detection window so the buffer
+        cannot grow without bound for a long-lived session. Fails open.
+        """
+        if not key or not tool_name:
+            return
+        try:
+            signature = self._tool_call_signature(tool_name, arguments)
+            now = time.monotonic()
+            window = _loop_window_s()
+            with self._lock:
+                ring = self._recent_tool_calls.get(key)
+                if ring is None:
+                    ring = deque(maxlen=_LOOP_RING_MAXLEN)
+                    self._recent_tool_calls[key] = ring
+                ring.append((signature, now))
+                # Prune entries older than the window from the left.
+                while ring and (now - ring[0][1]) > window:
+                    ring.popleft()
+        except Exception as exc:
+            _diag.debug(
+                "recording tool-call signature failed open (%s)",
+                type(exc).__name__,
+            )
+
+    def max_repeat_count_in_window(self, key: str) -> tuple[str | None, int]:
+        """Most-repeated recent signature for a session and its count.
+
+        Returns ``(signature, count)`` over calls within the loop window;
+        ``(None, 0)`` when the session has no tracked calls. Fails open to
+        ``(None, 0)``.
+        """
+        try:
+            now = time.monotonic()
+            window = _loop_window_s()
+            with self._lock:
+                ring = self._recent_tool_calls.get(key)
+                if not ring:
+                    return (None, 0)
+                counts: dict[str, int] = {}
+                for signature, ts in ring:
+                    if (now - ts) <= window:
+                        counts[signature] = counts.get(signature, 0) + 1
+            if not counts:
+                return (None, 0)
+            top = max(counts.items(), key=lambda item: item[1])
+            return top
+        except Exception:
+            return (None, 0)
 
     @staticmethod
     def _read_agent_label_header() -> str | None:
@@ -580,10 +676,42 @@ class UnityInstanceMiddleware(Middleware):
                 structured_content=busy,
             )
         tool_name, arguments = self._tool_call_shape(context)
+        session_key: str | None = None
+        if tool_name is not None:
+            try:
+                session_key = await self.get_session_key(context.fastmcp_context)
+                self.record_tool_call_signature(session_key, tool_name, arguments)
+            except Exception as exc:
+                _diag.debug(
+                    "tool-call signature tracking failed open (%s)",
+                    type(exc).__name__,
+                )
+            self._mark_call_start(session_key, tool_name)
         await self._note_play_dispatch(context, tool_name, arguments)
-        result = await call_next(context)
+        try:
+            result = await call_next(context)
+        finally:
+            self._mark_call_end(session_key)
         await self._observe_play_result(context, tool_name, arguments, result)
         return result
+
+    @staticmethod
+    def _mark_call_start(session_key: str | None, tool_name: str | None) -> None:
+        try:
+            from services.state.call_activity import call_activity
+
+            call_activity.mark_call_start(session_key, tool_name)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _mark_call_end(session_key: str | None) -> None:
+        try:
+            from services.state.call_activity import call_activity
+
+            call_activity.mark_call_end(session_key)
+        except Exception:
+            pass
 
     @staticmethod
     def _tool_call_shape(context: MiddlewareContext) -> tuple[str | None, dict | None]:

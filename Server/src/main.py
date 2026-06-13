@@ -274,6 +274,16 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
             }
         )).start()
 
+    # Start the session-roster heartbeat loop (MCPC-028): periodically pushes
+    # the agent roster to the connected bridge so the dashboard stays fresh.
+    roster_task: asyncio.Task | None = None
+    try:
+        from services.state.session_roster import roster_heartbeat_loop
+
+        roster_task = asyncio.create_task(roster_heartbeat_loop())
+    except Exception as exc:
+        logger.debug("Could not start session-roster heartbeat loop: %r", exc)
+
     try:
         # Yield shared state for lifespan consumers (e.g., middleware)
         yield {
@@ -281,6 +291,12 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
             "plugin_registry": _plugin_registry,
         }
     finally:
+        if roster_task is not None and not roster_task.done():
+            roster_task.cancel()
+            try:
+                await roster_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if _unity_connection_pool:
             _unity_connection_pool.disconnect_all()
         logger.info("MCP for Unity Server shut down")
@@ -386,6 +402,21 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
             "version": _server_version or "unknown",
             "message": "MCP for Unity server is running"
         })
+
+    @mcp.custom_route("/agent-status", methods=["POST"])
+    async def agent_status_http(request: Request) -> JSONResponse:
+        """Fire-and-forget ingest for harness status hooks (MCPC-031).
+
+        Accepts ``{label, session, event, summary, ts}`` and records it into
+        the in-memory agent-status store. Responds 200 quickly; the body is
+        ignored by the hook. Malformed or missing fields are tolerated and
+        never produce a 500 — a slow or erroring route must never block an
+        agent. A meaningful ingest opportunistically nudges a roster push.
+        """
+        from services.state.agent_status_store import handle_agent_status_post
+
+        body, status_code = await handle_agent_status_post(request)
+        return JSONResponse(body, status_code=status_code)
 
     @mcp.custom_route("/api/auth/login-url", methods=["GET"])
     async def auth_login_url(_: Request) -> JSONResponse:

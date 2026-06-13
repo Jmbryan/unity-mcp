@@ -564,6 +564,54 @@ async def _session_display_name(ctx) -> str | None:
         return None
 
 
+async def _session_key(ctx) -> str | None:
+    try:
+        from transport.unity_instance_middleware import get_unity_instance_middleware
+
+        return await get_unity_instance_middleware().get_session_key(ctx)
+    except Exception:
+        return None
+
+
+def _mark_parked(session_key: str | None, reason: str, owner: str | None) -> None:
+    try:
+        from services.state.call_activity import call_activity
+
+        call_activity.mark_parked(session_key, reason, owner)
+    except Exception:
+        pass
+
+
+def _clear_parked(session_key: str | None, was_marked: bool) -> None:
+    if not was_marked:
+        return
+    try:
+        from services.state.call_activity import call_activity
+
+        call_activity.clear_parked(session_key)
+    except Exception:
+        pass
+
+
+async def _record_activity(ctx, concurrency_class: str) -> None:
+    """Record per-session activity recency for roster state derivation.
+
+    Reads (and wrapper) are not activity for the `active`/`editing` states;
+    mutate/exclusive/play-scoped all count, with mutate/exclusive marking
+    `editing`. Fails open.
+    """
+    try:
+        if concurrency_class in (CLASS_READ, CLASS_WRAPPER):
+            return
+        from services.state.call_activity import call_activity
+
+        key = await _session_key(ctx)
+        is_mutate = concurrency_class in (CLASS_MUTATE, CLASS_EXCLUSIVE)
+        call_activity.mark_activity(key, is_mutate)
+    except Exception:
+        pass
+
+
 async def gate_for_class(
     ctx,
     concurrency_class: str,
@@ -589,6 +637,8 @@ async def gate_for_class(
     started = time.monotonic()
     deadline = started + budget
     last_heartbeat = 0.0
+    session_key = await _session_key(ctx)
+    parked_marked = False
 
     while True:
         block: tuple[str, str | None] | None = None
@@ -626,7 +676,11 @@ async def gate_for_class(
                 )
                 lease_busy = None
             if lease_busy is not None:
+                _clear_parked(session_key, parked_marked)
                 return lease_busy
+            if parked_marked:
+                _clear_parked(session_key, True)
+                parked_marked = False
             if concurrency_class == CLASS_EXCLUSIVE:
                 # The caller is about to drive an exclusive transition; record
                 # it as the owner so calls parked behind it see attribution.
@@ -638,8 +692,11 @@ async def gate_for_class(
             return None
 
         reason, owner = block
+        _mark_parked(session_key, reason, owner)
+        parked_marked = True
         now = time.monotonic()
         if now >= deadline:
+            _clear_parked(session_key, parked_marked)
             return _busy_response(reason, owner, tool_name)
         if now - last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
             last_heartbeat = now
@@ -666,6 +723,7 @@ async def gate_tool_call(ctx, tool_name: str, arguments: Any) -> dict[str, Any] 
         concurrency_class = await resolve_tool_class(
             tool_name, arguments, unity_instance, user_id
         )
+        await _record_activity(ctx, concurrency_class)
         return await gate_for_class(ctx, concurrency_class, tool_name, unity_instance)
     except Exception as exc:
         logger.debug("operation_gate: gate failed open for '%s': %r", tool_name, exc)
