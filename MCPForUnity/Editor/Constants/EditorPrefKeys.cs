@@ -69,6 +69,7 @@ namespace MCPForUnity.Editor.Constants
 
         internal const string AutoStartOnLoad = "MCPForUnity.AutoStartOnLoad";
         internal const string StopServerOnEditorQuit = "MCPForUnity.StopServerOnEditorQuit";
+        internal const string HttpServerLaunchConfirmed = "MCPForUnity.HttpServerLaunchConfirmed";
         internal const string BatchExecuteMaxCommands = "MCPForUnity.BatchExecute.MaxCommands";
         internal const string LogRecordEnabled = "MCPForUnity.LogRecordEnabled";
 
