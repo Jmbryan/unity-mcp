@@ -5,7 +5,7 @@ This middleware intercepts all tool calls and injects the active Unity instance
 into the request-scoped state, allowing tools to access it via ctx.get_state("unity_instance").
 """
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import RLock
 import hashlib
 import json
@@ -84,21 +84,48 @@ def _loop_window_s() -> float:
     return max(1.0, value)
 
 
+# Session-identity inactivity TTL (seconds): an identity not seen on any request
+# within this window is evicted so a hard-killed console (which never fires a
+# SessionEnd hook) stops occupying a dashboard row. Mirrors the agent-status
+# store's TTL/grace pair (DEFAULT_AGENT_TTL_SECONDS / ENDED_GRACE_SECONDS). The
+# grace window keeps the row visible briefly as 'disconnected' before it drops.
+_DEFAULT_IDENTITY_TTL_SECONDS = 900.0
+_IDENTITY_TTL_GRACE_SECONDS = 30.0
+_MAX_IDENTITY_TTL_SECONDS = 86400.0
+
+
+def _identity_ttl_s() -> float:
+    raw = os.environ.get("UNITY_MCP_IDENTITY_TTL_S")
+    if raw is None:
+        return _DEFAULT_IDENTITY_TTL_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_IDENTITY_TTL_SECONDS
+    return max(0.01, min(value, _MAX_IDENTITY_TTL_SECONDS))
+
+
 @dataclass
 class SessionIdentity:
     """Sticky identity for one MCP session.
 
-    Assigned on first sight of a session key and held for the server process
-    lifetime (state intentionally dies with the process — fail-open). The
-    optional ``label`` is the human-meaningful agent label supplied via the
-    ``X-Agent-Label`` header; labeled sessions display it, unlabeled sessions
-    fall back to the auto-assigned friendly name.
+    Assigned on first sight of a session key. The optional ``label`` is the
+    human-meaningful agent label supplied via the ``X-Agent-Label`` header;
+    labeled sessions display it, unlabeled sessions fall back to the
+    auto-assigned friendly name.
+
+    ``last_seen`` is a monotonic timestamp refreshed on every access that proves
+    the session is live (a request passing through the middleware). It drives
+    TTL eviction so a hard-killed console's dashboard row self-heals without any
+    SessionEnd hook — the row reaches 'disconnected' during the grace window and
+    then disappears once the TTL elapses.
     """
 
     key: str
     name: str
     color: str
     label: str | None = None
+    last_seen: float = field(default_factory=time.monotonic)
 
     @property
     def display_name(self) -> str:
@@ -196,7 +223,14 @@ class UnityInstanceMiddleware(Middleware):
             self._active_by_key.pop(key, None)
 
     def ensure_session_identity_for_key(self, key: str) -> SessionIdentity:
-        """Return the sticky identity for a session key, assigning one on first sight."""
+        """Return the sticky identity for a session key, assigning one on first sight.
+
+        Refreshes the identity's ``last_seen`` monotonic stamp — this method sits
+        on the live-request path (every tool/resource call reaches it via
+        ``get_session_identity``), so the refresh is the liveness signal the TTL
+        eviction reads.
+        """
+        now = time.monotonic()
         with self._lock:
             identity = self._identity_by_key.get(key)
             if identity is None:
@@ -207,10 +241,12 @@ class UnityInstanceMiddleware(Middleware):
                 if cycle:
                     name = f"{name}-{cycle + 1}"
                 color = _IDENTITY_COLORS[index % len(_IDENTITY_COLORS)]
-                identity = SessionIdentity(key=key, name=name, color=color)
+                identity = SessionIdentity(key=key, name=name, color=color, last_seen=now)
                 self._identity_by_key[key] = identity
                 logger.info("Assigned session identity '%s' (%s) to key %s",
                             name, color, key)
+            else:
+                identity.last_seen = now
             return identity
 
     async def get_session_identity(self, ctx) -> SessionIdentity:
@@ -218,9 +254,33 @@ class UnityInstanceMiddleware(Middleware):
         key = await self.get_session_key(ctx)
         return self.ensure_session_identity_for_key(key)
 
+    def _expire_identities_locked(self, now_mono: float) -> None:
+        """Drop identities not seen within the TTL+grace window. Caller holds lock.
+
+        The TTL gates the disappearance; the grace adds a short tail past the TTL
+        so a session that just went stale still surfaces (as 'disconnected' once
+        the agent-status entry reports ended, else 'idle') for one more window
+        before the row is removed.
+        """
+        ttl = _identity_ttl_s() + _IDENTITY_TTL_GRACE_SECONDS
+        for key in list(self._identity_by_key):
+            if (now_mono - self._identity_by_key[key].last_seen) > ttl:
+                identity = self._identity_by_key.pop(key)
+                self._active_by_key.pop(key, None)
+                self._recent_tool_calls.pop(key, None)
+                logger.info("Evicted stale session identity '%s' (key %s)",
+                            identity.name, key)
+
     def all_session_identities(self) -> list[SessionIdentity]:
-        """Snapshot of every assigned session identity (roster source)."""
+        """Snapshot of every live session identity (roster source).
+
+        Stale identities (no request within the TTL+grace window) are evicted
+        here so the roster self-heals on any disconnect mode — including a hard
+        kill that never fires a SessionEnd hook.
+        """
+        now = time.monotonic()
         with self._lock:
+            self._expire_identities_locked(now)
             return list(self._identity_by_key.values())
 
     # ------------------------------------------------------------------

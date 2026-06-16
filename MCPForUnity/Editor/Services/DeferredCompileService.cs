@@ -84,6 +84,27 @@ namespace MCPForUnity.Editor.Services
             HasPendingCompile ? SessionState.GetString(SessionKey_PendingReason, "deferred") : null;
 
         /// <summary>
+        /// Number of script imports currently held pending flush. Counts newline-delimited paths in
+        /// the queued-imports buffer; zero when nothing is queued (a held compile may still exist with
+        /// no queued import — e.g. a bare <see cref="RequestCompile"/> deferral).
+        /// </summary>
+        internal static int PendingImportCount
+        {
+            get
+            {
+                var queued = SessionState.GetString(SessionKey_PendingImports, string.Empty);
+                if (string.IsNullOrEmpty(queued)) return 0;
+
+                int count = 0;
+                foreach (var p in queued.Split('\n'))
+                {
+                    if (!string.IsNullOrEmpty(p)) count++;
+                }
+                return count;
+            }
+        }
+
+        /// <summary>
         /// Request a script compilation through the defer funnel. Fires immediately when idle;
         /// records the request and returns when play mode or a test run is active.
         /// Returns true if the compile was deferred, false if it fired immediately.

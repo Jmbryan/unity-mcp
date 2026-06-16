@@ -76,9 +76,27 @@ namespace MCPForUnity.Editor.Services
         }
 
         /// <summary>
-        /// Flushes any compile that the local <see cref="DeferredCompileService"/> is holding.
-        /// Local editor operation; safe no-op when nothing is pending. Intended to let a controlling
-        /// session release a peer's held compile once the blocking play/test span has ended.
+        /// True when this bridge's local <see cref="DeferredCompileService"/> is holding a compile
+        /// pending return to idle (play/test span active). Local read; no server round-trip.
+        /// </summary>
+        public static bool HasPendingCompile => DeferredCompileService.HasPendingCompile;
+
+        /// <summary>
+        /// Reason recorded for the locally held compile, or null when nothing is pending. Local read.
+        /// </summary>
+        public static string PendingCompileReason => DeferredCompileService.PendingReason;
+
+        /// <summary>
+        /// Number of script imports the local <see cref="DeferredCompileService"/> is holding pending
+        /// flush. Zero when none are queued (a held compile may still exist with no queued import).
+        /// Local read.
+        /// </summary>
+        public static int PendingCompileImportCount => DeferredCompileService.PendingImportCount;
+
+        /// <summary>
+        /// Flushes any compile that this bridge's local <see cref="DeferredCompileService"/> is
+        /// holding. Local editor operation (a no-op when nothing is pending or a play/test span is
+        /// still active) — it acts only on this instance's own held compile, not any peer's.
         /// </summary>
         public static void FlushDeferredCompile()
         {

@@ -50,6 +50,14 @@ DEFAULT_HEARTBEAT_SECONDS = 2.5
 # state enum; mutate within this window is `editing`.
 ACTIVE_RECENCY_SECONDS = 20.0
 
+# Window in which a hook event (PreToolUse from this agent or any of its
+# subagents — AGENT_LABEL is process-tree inherited, so a subagent's events land
+# on the parent row) keeps the row `active`. Hook events are sparser than MCP
+# calls (PreToolUse only, no PostToolUse), so this window is wider than the MCP
+# one. The hook cannot distinguish mutate from read, so it only feeds `active`,
+# never `editing`.
+HOOK_ACTIVE_RECENCY_SECONDS = 45.0
+
 # Window for the intent-stale flag's "activity continues" signal.
 INTENT_ACTIVITY_RECENCY_SECONDS = 120.0
 
@@ -117,6 +125,7 @@ def _derive_state(
     parked: dict | None,
     any_age: float | None,
     mutate_age: float | None,
+    hook_age: float | None,
     ended: bool,
 ) -> str:
     if holds_play_lease:
@@ -127,7 +136,14 @@ def _derive_state(
         return "waiting-parked"
     if mutate_age is not None and mutate_age <= ACTIVE_RECENCY_SECONDS:
         return "editing"
+    # `active` if EITHER recent MCP traffic OR recent hook activity. Hook events
+    # (including a working subagent's) prove the agent is busy even when its own
+    # MCP-call clock has gone quiet — without this an agent whose subagents are
+    # doing all the work would read 'idle'. Hook recency only feeds `active`, not
+    # `editing` (the hook can't tell mutate from read).
     if any_age is not None and any_age <= ACTIVE_RECENCY_SECONDS:
+        return "active"
+    if hook_age is not None and hook_age <= HOOK_ACTIVE_RECENCY_SECONDS:
         return "active"
     if ended:
         return "disconnected"
@@ -213,12 +229,24 @@ def _build_roster_inner() -> dict[str, Any]:
 
         ended = bool(agent_status.ended) if agent_status is not None else False
 
+        # Hook activity recency (full-source rows only): the hook clock is
+        # refreshed on every hook event, including a working subagent's, so it
+        # proves liveness even when this row's own MCP-call clock is quiet.
+        hook_age: float | None = None
+        if (
+            agent_status is not None
+            and not ended
+            and agent_status.last_activity_unix > 0
+        ):
+            hook_age = max(0.0, now_unix - agent_status.last_activity_unix)
+
         state = _derive_state(
             holds_play_lease=holds_play_lease,
             owns_test_job=owns_test_job,
             parked=parked,
             any_age=any_age,
             mutate_age=mutate_age,
+            hook_age=hook_age,
             ended=ended,
         )
 

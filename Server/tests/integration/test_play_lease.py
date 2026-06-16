@@ -289,6 +289,114 @@ class TestImplicitAcquire:
 
 
 # ----------------------------------------------------------------------
+# Wrapper side-door attribution (MCPC-009)
+# ----------------------------------------------------------------------
+CHANGING_STATE = {
+    "compilation": {},
+    "editor": {"play_mode": {"is_playing": False, "is_changing": True}},
+    "tests": {},
+}
+
+
+class TestWrapperPlayAttribution:
+    """A play-enter dispatched through a wrapper tool (batch_execute /
+    execute_custom_tool) records a play intent for the CALLING session, so the
+    lease the play transition produces is attributed to the agent — never the
+    fall-through "user" owner (MCPC-009)."""
+
+    @pytest.mark.asyncio
+    async def test_post_hoc_attributes_settled_play_edge_to_caller(self, monkeypatch):
+        """A play edge that has already SETTLED (is_playing True, is_changing
+        False) when the synchronous wrapper call returns still attributes: the
+        intent is recorded, then the subsequent editor-state observation
+        consumes it instead of defaulting to 'user'."""
+        from services.state.operation_gate import (
+            record_exclusive_edge_after_arbitrary_code,
+        )
+
+        await _register_instance()
+        editor_state_cache.reset(ttl_s=0.0)
+        _inject_state(monkeypatch, FakeEditorState(PLAYING_STATE))
+
+        ctx_a = await _pinned_context()
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        await middleware.set_active_instance(ctx_a, INSTANCE)
+
+        # The post-hoc edge recording (as called by the wrappers) records the
+        # intent BEFORE the forced 0-age fetch that drives observe_editor_state.
+        await record_exclusive_edge_after_arbitrary_code(ctx_a, INSTANCE)
+
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease is not None
+        assert lease.owner_key == ctx_a.session_id  # the caller, not "user"
+        assert lease.owner_display != "user"
+
+    @pytest.mark.asyncio
+    async def test_non_play_edge_does_not_leave_stale_intent(self, monkeypatch):
+        """An execute path that turns out NOT to be a play edge must not leave a
+        speculative intent behind that would steal a later 'user' play-enter."""
+        from services.state.operation_gate import (
+            record_exclusive_edge_after_arbitrary_code,
+        )
+
+        await _register_instance()
+        editor_state_cache.reset(ttl_s=0.0)
+        _inject_state(monkeypatch, FakeEditorState(IDLE_STATE))
+
+        ctx_a = await _pinned_context()
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        await middleware.set_active_instance(ctx_a, INSTANCE)
+
+        await record_exclusive_edge_after_arbitrary_code(ctx_a, INSTANCE)
+        assert play_lease_manager.get_active_lease(INSTANCE) is None
+
+        # A later human play-enter (no MCP cause) must still resolve to "user".
+        editor_state_cache.reset(ttl_s=0.0)
+        _inject_state(monkeypatch, FakeEditorState(PLAYING_STATE))
+        await editor_state_cache.get(DummyContext(), INSTANCE)
+
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease is not None
+        assert lease.owner_key is None
+        assert lease.owner_display == "user"
+
+    @pytest.mark.asyncio
+    async def test_batch_execute_inner_play_attributes_to_caller(self, monkeypatch):
+        """End-to-end through batch_execute: an inner manage_editor action=play
+        leases to the calling session, not 'user'."""
+        import services.tools.batch_execute as batch_mod
+
+        await _register_instance()
+        editor_state_cache.reset(ttl_s=0.0)
+        _inject_state(monkeypatch, FakeEditorState(PLAYING_STATE))
+
+        ctx_a = await _pinned_context()
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        await middleware.set_active_instance(ctx_a, INSTANCE)
+
+        async def fake_send(send_fn, unity_instance, command, payload):
+            return {"success": True, "message": "Entered play mode."}
+
+        monkeypatch.setattr(batch_mod, "send_with_unity_instance", fake_send)
+        # No editor-state limit lookup fan-out.
+        monkeypatch.setattr(batch_mod, "_cached_max_commands", 25, raising=False)
+
+        result = await batch_mod.batch_execute(
+            ctx_a,
+            commands=[{"tool": "manage_editor", "params": {"action": "play"}}],
+        )
+
+        assert result["success"] is True
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease is not None
+        assert lease.owner_key == ctx_a.session_id
+        assert lease.owner_display != "user"
+
+
+# ----------------------------------------------------------------------
 # Non-owner enforcement (MCPC-013/014/015)
 # ----------------------------------------------------------------------
 class TestNonOwnerEnforcement:

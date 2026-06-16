@@ -12,13 +12,24 @@ from services.state.operation_gate import (
     CLASS_READ,
     escalate_class,
     gate_for_class,
+    record_exclusive_edge_after_arbitrary_code,
     resolve_tool_class,
 )
+from services.state.play_lease import record_play_intent_for_session
 from services.tools import get_unity_instance_from_context
 from transport.unity_transport import send_with_unity_instance
 from transport.legacy.unity_connection import async_send_command_with_retry
 
 logger = logging.getLogger(__name__)
+
+
+def _is_play_enter(command: dict[str, Any]) -> bool:
+    """True when an inner command is a ``manage_editor`` play-enter."""
+    if command.get("tool") != "manage_editor":
+        return False
+    params = command.get("params") or {}
+    action = params.get("action") if isinstance(params, dict) else None
+    return isinstance(action, str) and action.strip().lower() == "play"
 
 # Fallback used when the Unity-side configured limit is not yet known.
 DEFAULT_MAX_COMMANDS_PER_BATCH = 25
@@ -140,11 +151,24 @@ async def batch_execute(
     # at the max-severity class (a batch of reads stays a read).
     user_id = await get_unity_instance_from_context(ctx, "user_id")
     effective_class = CLASS_READ
+    has_play_enter = False
     for command in normalized_commands:
         inner_class = await resolve_tool_class(
             command["tool"], command["params"], unity_instance, user_id
         )
         effective_class = escalate_class(effective_class, inner_class)
+        if _is_play_enter(command):
+            has_play_enter = True
+
+    # Close the lease side door (MCPC-009): the middleware only sees the outer
+    # wrapper, so an inner play-enter dispatched here would record no play intent
+    # and the lease (settled by the gate's own state fetch, or by a later
+    # editor-state observation) would misattribute to "user". Record the intent
+    # for this session BEFORE the gate runs — its state fetch consumes the
+    # intent and attributes the lease to the caller.
+    if has_play_enter:
+        await record_play_intent_for_session(ctx, unity_instance)
+
     busy = await gate_for_class(ctx, effective_class, "batch_execute", unity_instance)
     if busy is not None:
         return busy
@@ -160,9 +184,18 @@ async def batch_execute(
     if max_parallelism is not None:
         payload["maxParallelism"] = int(max_parallelism)
 
-    return await send_with_unity_instance(
+    response = await send_with_unity_instance(
         async_send_command_with_retry,
         unity_instance,
         "batch_execute",
         payload,
     )
+
+    # A play edge that only settles after dispatch (the gate saw an idle editor)
+    # is attributed post-hoc, mirroring execute_code's arbitrary-code edge.
+    if has_play_enter and (
+        not isinstance(response, dict) or response.get("success", True)
+    ):
+        await record_exclusive_edge_after_arbitrary_code(ctx, unity_instance)
+
+    return response

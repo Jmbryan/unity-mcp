@@ -157,6 +157,34 @@ class TestStateEnum:
         entry = _entry_for(build_roster(), "sess-1")
         assert entry["state"] == "disconnected"
 
+    def test_active_from_hook_clock_only(self):
+        """A row reads 'active' on fresh hook activity even with no recent MCP call.
+
+        Regression (Fix #7): a working subagent's hook events refresh the parent
+        row's hook clock; the state must reflect that liveness instead of 'idle'.
+        """
+        self._setup()
+        # Fresh hook event, but no MCP call recorded for this session at all.
+        agent_status_store.ingest(
+            {"label": "agent-a", "event": EVENT_PRE_TOOL_USE, "summary": "subagent working", "ts": time.time()}
+        )
+        entry = _entry_for(build_roster(), "sess-1")
+        assert entry["state"] == "active"
+
+    def test_idle_when_hook_clock_is_stale(self):
+        """A stale hook clock (beyond the hook window) does not hold 'active'."""
+        self._setup()
+        agent_status_store.ingest(
+            {
+                "label": "agent-a",
+                "event": EVENT_PRE_TOOL_USE,
+                "summary": "old work",
+                "ts": time.time() - (roster_mod.HOOK_ACTIVE_RECENCY_SECONDS + 30.0),
+            }
+        )
+        entry = _entry_for(build_roster(), "sess-1")
+        assert entry["state"] == "idle"
+
 
 class TestIntentMostSpecificWins:
     def _setup(self):
@@ -218,6 +246,53 @@ class TestFlags:
         _identity(middleware, "sess-1", label="agent-a")
         entry = _entry_for(build_roster(), "sess-1")
         assert entry["flags"] == []
+
+
+class TestStaleIdentityEviction:
+    """Fix #1: identities not seen within the TTL+grace window leave the roster.
+
+    Self-heals on any disconnect mode (including a hard kill that never fires a
+    SessionEnd hook), since the row's survival hangs on liveness, not on a hook.
+    """
+
+    def test_stale_identity_dropped_from_roster(self):
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        identity = _identity(middleware, "sess-stale", label="agent-stale")
+
+        # Fresh identity is present.
+        assert _entry_for(build_roster(), "sess-stale") is not None
+
+        # Age last_seen past the TTL + grace window (monotonic clock).
+        from transport.unity_instance_middleware import (
+            _identity_ttl_s,
+            _IDENTITY_TTL_GRACE_SECONDS,
+        )
+        identity.last_seen = (
+            time.monotonic() - (_identity_ttl_s() + _IDENTITY_TTL_GRACE_SECONDS + 10.0)
+        )
+
+        # The stale row is gone; the snapshot evicts it.
+        assert _entry_for(build_roster(), "sess-stale") is None
+        assert middleware.all_session_identities() == []
+
+    def test_live_access_refreshes_last_seen_and_keeps_row(self):
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        identity = _identity(middleware, "sess-live", label="agent-live")
+
+        # Push it to the brink of eviction...
+        from transport.unity_instance_middleware import (
+            _identity_ttl_s,
+            _IDENTITY_TTL_GRACE_SECONDS,
+        )
+        identity.last_seen = (
+            time.monotonic() - (_identity_ttl_s() + _IDENTITY_TTL_GRACE_SECONDS + 10.0)
+        )
+        # ...but a live request (ensure_session_identity_for_key) refreshes it.
+        middleware.ensure_session_identity_for_key("sess-live")
+
+        assert _entry_for(build_roster(), "sess-live") is not None
 
 
 class TestEnvelope:

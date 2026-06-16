@@ -745,29 +745,48 @@ async def record_exclusive_edge_after_arbitrary_code(ctx, unity_instance: str | 
     to the calling session so parked calls see attribution. Never raises.
     """
     try:
+        from services.state.play_lease import (
+            clear_play_intent_for_session,
+            record_play_intent_for_session,
+        )
+
+        # Record the play intent BEFORE the forced 0-age fetch below: that
+        # fetch synchronously feeds the snapshot to the play lease (cache
+        # notify -> observe_editor_state), which would otherwise acquire the
+        # lease for "user" on a settled play edge before any intent exists.
+        # A spurious intent (the code was not a play edge) is harmless — it
+        # has a short TTL and is cleared after the snapshot is inspected.
+        await record_play_intent_for_session(ctx, unity_instance)
+
         state = await editor_state_cache.get(ctx, unity_instance, max_age_s=0.0)
         if not isinstance(state, dict):
             return
         compilation = state.get("compilation") or {}
         play_mode = (state.get("editor") or {}).get("play_mode") or {}
+        is_play_edge = (
+            play_mode.get("is_changing") is True or play_mode.get("is_playing") is True
+        )
         kind: str | None = None
         if compilation.get("is_compiling") is True or compilation.get(
             "is_domain_reload_pending"
         ) is True:
             kind = "compile"
-        elif play_mode.get("is_changing") is True:
+        elif is_play_edge:
+            # A transition that has already settled (is_playing True) when the
+            # synchronous call returns must still attribute, not only one still
+            # in flight (is_changing True).
             kind = "play_transition"
+
+        if kind != "play_transition":
+            # Not a play edge: drop the pre-recorded intent so it cannot
+            # misattribute a later, unrelated play-enter.
+            await clear_play_intent_for_session(ctx, unity_instance)
+
         if kind is None:
             return
         owner = await _session_display_name(ctx)
         if owner:
             editor_state_cache.record_exclusive_edge(unity_instance, owner, kind=kind)
-        if kind == "play_transition":
-            # The arbitrary code started a play transition: attribute the
-            # upcoming play lease to this session as well.
-            from services.state.play_lease import record_play_intent_for_session
-
-            await record_play_intent_for_session(ctx, unity_instance)
     except Exception as exc:
         logger.debug(
             "operation_gate: post-hoc exclusive-edge recording skipped: %r", exc

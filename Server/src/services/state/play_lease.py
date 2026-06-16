@@ -631,7 +631,8 @@ async def record_play_intent_for_session(ctx, unity_instance: str | None) -> Non
     """Attribute an observed play transition to the calling session.
 
     Used for calls that cannot be classified by inspection (arbitrary-code
-    execution) when a play edge is detected after the fact. Never raises.
+    execution, wrapper-dispatched play-enters) when a play edge is detected
+    after the fact. Never raises.
     """
     try:
         session_key, display_name = await _session_key_and_display(ctx)
@@ -642,6 +643,21 @@ async def record_play_intent_for_session(ctx, unity_instance: str | None) -> Non
         )
     except Exception as exc:
         logger.debug("play_lease: post-hoc intent recording skipped: %r", exc)
+
+
+async def clear_play_intent_for_session(ctx, unity_instance: str | None) -> None:
+    """Drop the calling session's pending play intent.
+
+    Used to undo a speculatively recorded intent once inspection shows the
+    call was not a play edge after all. Never raises.
+    """
+    try:
+        session_key, _ = await _session_key_and_display(ctx)
+        if not session_key:
+            return
+        play_lease_manager.clear_play_intent(unity_instance, session_key)
+    except Exception as exc:
+        logger.debug("play_lease: intent clear skipped: %r", exc)
 
 
 async def observe_play_call_result(
