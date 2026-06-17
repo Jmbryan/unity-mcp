@@ -406,6 +406,15 @@ class RosterPublisher:
             fingerprint = _roster_fingerprint(roster)
             now = time.monotonic()
             with self._lock:
+                # Suppress an empty-sessions roster while a bridge is connected: it is
+                # almost always a transient identity gap (TTL eviction race, momentary
+                # no-live-identity window), not a real "all agents gone" event, and would
+                # clobber a good snapshot on the dashboard. Skip without recording the
+                # fingerprint so the next genuine non-empty roster still counts as
+                # changed and pushes. force=True (on-register push, deliberate empty)
+                # bypasses the guard.
+                if not force and not roster.get("sessions") and _has_connected_bridge():
+                    return False
                 changed = fingerprint != self._last_fingerprint
                 heartbeat_due = (now - self._last_push_mono) >= _heartbeat_s()
                 if not force and not changed and not heartbeat_due:
@@ -419,6 +428,13 @@ class RosterPublisher:
 
 
 roster_publisher = RosterPublisher()
+
+
+def _has_connected_bridge() -> bool:
+    """True when the hub is configured and at least one bridge WebSocket is live."""
+    from transport.plugin_hub import PluginHub
+
+    return PluginHub.is_configured() and bool(getattr(PluginHub, "_connections", {}))
 
 
 async def _push_roster(roster: dict[str, Any]) -> bool:

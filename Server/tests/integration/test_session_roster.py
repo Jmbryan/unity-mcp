@@ -14,6 +14,7 @@ Covers:
 Offline: pure in-memory state; the bridge WS is a fake capturing send_json.
 """
 
+import asyncio
 import time
 
 import pytest
@@ -367,3 +368,106 @@ class TestPush:
         play_lease_manager.acquire(INSTANCE, "sess-1", "AgentA")
         assert await roster_publisher.maybe_push() is True
         assert len(ws.sent) == 2
+
+    @pytest.mark.asyncio
+    async def test_empty_roster_suppressed_while_bridge_connected(self, monkeypatch):
+        """Bug 2: a transient empty-sessions roster must not clobber a good one.
+
+        A non-forced push with no live identities and a bridge connected is skipped
+        without recording the fingerprint, so a subsequent genuine non-empty roster
+        still counts as changed and pushes.
+        """
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+
+        ws = _FakeWS()
+        monkeypatch.setattr(PluginHub, "_connections", {"bridge-1": ws})
+        monkeypatch.setattr(PluginHub, "is_configured", classmethod(lambda cls: True))
+        monkeypatch.setenv("UNITY_MCP_ROSTER_HEARTBEAT_S", "9999")
+
+        # No identities: empty-sessions roster. Suppressed while a bridge is present.
+        assert await roster_publisher.maybe_push() is False
+        assert ws.sent == []
+
+        # An identity now appears: the prior skip did not poison change detection.
+        _identity(middleware, "sess-1", label="agent-a")
+        assert await roster_publisher.maybe_push() is True
+        assert ws.sent[-1]["type"] == ROSTER_MESSAGE_TYPE
+        assert any(s["session_key"] == "sess-1" for s in ws.sent[-1]["sessions"])
+
+    @pytest.mark.asyncio
+    async def test_forced_empty_roster_still_pushes(self, monkeypatch):
+        """force=True (the on-register push, deliberate empty) bypasses the guard."""
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+
+        ws = _FakeWS()
+        monkeypatch.setattr(PluginHub, "_connections", {"bridge-1": ws})
+        monkeypatch.setattr(PluginHub, "is_configured", classmethod(lambda cls: True))
+
+        assert await roster_publisher.maybe_push(force=True) is True
+        assert ws.sent[-1]["type"] == ROSTER_MESSAGE_TYPE
+        assert ws.sent[-1]["sessions"] == []
+
+
+class TestRegisterPush:
+    @pytest.mark.asyncio
+    async def test_register_force_pushes_roster_to_new_bridge(self, monkeypatch):
+        """Bug 1: a bridge registering gets the current roster within the round-trip.
+
+        Drives _handle_register with a fake websocket and a fake registry, then
+        asserts a forced roster reached the connected bridge even though nothing
+        changed.
+        """
+        from transport.models import RegisterMessage
+
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        _identity(middleware, "sess-1", label="agent-a")
+
+        class _RegisterWS(_FakeWS):
+            def __init__(self):
+                super().__init__()
+                self.state = type("S", (), {})()
+
+            async def close(self, code=1000):
+                pass
+
+        class _FakeSession:
+            def __init__(self, session_id):
+                self.session_id = session_id
+
+        class _FakeRegistry:
+            async def register(self, session_id, *args, **kwargs):
+                return _FakeSession(session_id), None
+
+        ws = _RegisterWS()
+        monkeypatch.setattr(PluginHub, "_registry", _FakeRegistry())
+        monkeypatch.setattr(PluginHub, "_lock", asyncio.Lock())
+        monkeypatch.setattr(PluginHub, "_connections", {})
+        monkeypatch.setattr(PluginHub, "_ping_tasks", {})
+        monkeypatch.setattr(PluginHub, "_last_pong", {})
+        monkeypatch.setattr(PluginHub, "is_configured", classmethod(lambda cls: True))
+        # Keep the per-session ping loop from actually running.
+        monkeypatch.setattr(
+            PluginHub,
+            "_ping_loop",
+            classmethod(lambda cls, sid, sock: asyncio.sleep(0)),
+        )
+        monkeypatch.setenv("UNITY_MCP_ROSTER_HEARTBEAT_S", "9999")
+
+        hub = PluginHub.__new__(PluginHub)
+        await hub._handle_register(
+            ws,
+            RegisterMessage(
+                type="register",
+                project_name="Game",
+                project_hash="hash-x",
+                unity_version="2022",
+                project_path="/tmp/game",
+            ),
+        )
+
+        roster_msgs = [m for m in ws.sent if m.get("type") == ROSTER_MESSAGE_TYPE]
+        assert roster_msgs, "register did not force a roster push to the new bridge"
+        assert any(s["session_key"] == "sess-1" for s in roster_msgs[-1]["sessions"])

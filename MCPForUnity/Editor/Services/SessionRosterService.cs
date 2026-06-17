@@ -64,6 +64,21 @@ namespace MCPForUnity.Editor.Services
                 RosterSnapshot snapshot = ParseRosterEnvelope(payload);
                 if (snapshot != null)
                 {
+                    // Reject a server-declared failed build (health.ok == false with no
+                    // sessions) that would clobber a populated snapshot: the fail-open
+                    // envelope carries no authoritative session data, so honoring it here
+                    // would replace a good roster with an empty one. A genuine empty roster
+                    // (health.ok == true, or no health block) still publishes so real
+                    // "all sessions gone" transitions render.
+                    bool isFailedEmpty = snapshot.Sessions.Count == 0
+                        && snapshot.Health != null
+                        && !snapshot.Health.Ok;
+                    if (isFailedEmpty && _lastSnapshot != null && _lastSnapshot.Sessions.Count > 0)
+                    {
+                        McpLog.Debug("[SessionRoster] Ignoring failed-build empty roster; keeping last good snapshot.");
+                        return;
+                    }
+
                     _lastSnapshot = snapshot;
                 }
             }

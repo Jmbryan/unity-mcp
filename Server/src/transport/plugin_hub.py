@@ -488,6 +488,18 @@ class PluginHub(WebSocketEndpoint):
         else:
             logger.info(f"Plugin registered: {project_name} ({project_hash})")
 
+        # Deliver the current roster to the freshly (re)connected bridge immediately.
+        # force=True bypasses the change/heartbeat gate so a restarted editor's bridge
+        # is populated within the registration round-trip instead of waiting on the
+        # next heartbeat or agent action. Best-effort: a roster failure never breaks
+        # registration.
+        try:
+            from services.state.session_roster import roster_publisher
+
+            await roster_publisher.maybe_push(force=True)
+        except Exception as exc:
+            logger.debug("session_roster: on-register push failed open: %r", exc)
+
     async def _handle_register_tools(self, websocket: WebSocket, payload: RegisterToolsMessage) -> None:
         cls = type(self)
         registry = cls._registry
