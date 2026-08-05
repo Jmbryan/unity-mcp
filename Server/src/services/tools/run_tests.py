@@ -43,6 +43,17 @@ def _note_test_job_status(
         logger.debug("run_tests: test-job status observation skipped: %r", exc)
 
 
+async def _session_display_name(ctx) -> str | None:
+    """Calling session's display name for attribution (fail-open)."""
+    try:
+        from transport.unity_instance_middleware import get_unity_instance_middleware
+
+        identity = await get_unity_instance_middleware().get_session_identity(ctx)
+        return identity.display_name
+    except Exception:
+        return None
+
+
 async def _get_unity_project_path(unity_instance: str | None) -> str | None:
     """Get the project root path for a Unity instance (for focus nudging).
 
@@ -256,6 +267,32 @@ async def run_tests(
         params["includeDetails"] = True
     if init_timeout is not None and init_timeout > 0:
         params["initTimeout"] = init_timeout
+    caller_display_name = await _session_display_name(ctx)
+    if caller_display_name:
+        # Bridge contract: TestJobManager stores this as the job's StartedBy,
+        # published back as tests.started_by for busy attribution.
+        params["startedBy"] = caller_display_name
+
+    from services.state.editor_state_cache import editor_state_cache
+    from services.state.play_lease import (
+        clear_play_intent_for_session,
+        record_play_intent_for_session,
+    )
+
+    # A PlayMode run enters play mode: record a play intent for this session
+    # (the same mechanism manage_editor action=play uses) so the resulting
+    # play-mode lease attributes to the caller, never the fall-through "user"
+    # owner. The intent's TTL may lapse across a long play-enter reload; the
+    # test-job ownership recorded below is the durable backstop the play
+    # lease's observation path also consults.
+    if mode == "PlayMode":
+        await record_play_intent_for_session(ctx, unity_instance)
+
+    # Pin the optimistic tests-pending marker BEFORE dispatch: compile-risk
+    # calls park immediately instead of racing the 1-2s window until the
+    # bridge snapshot publishes tests.is_running. Cleared on a definitive
+    # start failure below, by the first confirming snapshot, or by its TTL.
+    editor_state_cache.mark_tests_pending(unity_instance, caller_display_name)
 
     response = await unity_transport.send_with_unity_instance(
         async_send_command_with_retry,
@@ -263,6 +300,17 @@ async def run_tests(
         "run_tests",
         params,
     )
+
+    def _start_failed(resp: Any) -> bool:
+        return isinstance(resp, dict) and resp.get("success", True) is False
+
+    if _start_failed(response) or not isinstance(response, dict):
+        editor_state_cache.clear_tests_pending(unity_instance)
+        # Keep the intent for retry-hinted transport failures (the play-enter
+        # reload can eat a result that actually succeeded); drop it on a
+        # definitive refusal.
+        if mode == "PlayMode" and _start_failed(response) and response.get("hint") != "retry":
+            await clear_play_intent_for_session(ctx, unity_instance)
 
     if isinstance(response, dict):
         if not response.get("success", True):

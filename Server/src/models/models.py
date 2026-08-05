@@ -33,6 +33,10 @@ class ToolDefinitionModel(BaseModel):
     # ("read" / "mutate" / "exclusive" / "play-scoped"). Older bridges omit it;
     # the operation gate treats unknown or missing values as "mutate".
     concurrency_class: str | None = "mutate"
+    # Declared compile-risk flag (the tool can trigger a script import /
+    # compile). Older bridges omit it; the operation gate then fails safe for
+    # mutate/exclusive custom tools (see operation_gate.definition_compile_risk).
+    compile_risk: bool | None = None
     parameters: list[ToolParameterModel] = Field(default_factory=list)
 
 

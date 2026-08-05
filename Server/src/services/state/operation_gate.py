@@ -197,37 +197,47 @@ def escalate_class(current: str, new: str) -> str:
 # pattern as the middleware's tool-visibility metadata refresh.
 _REGISTRY_REFRESH_INTERVAL_SECONDS = 0.5
 _registry_class_by_name: dict[str, str] = {}
+_registry_compile_risk_by_name: dict[str, bool] = {}
 _registry_last_refresh = 0.0
 
 
-def _server_declared_class(tool_name: str) -> str | None:
+def _refresh_registry_maps() -> None:
     global _registry_last_refresh
     now = time.monotonic()
-    if now - _registry_last_refresh >= _REGISTRY_REFRESH_INTERVAL_SECONDS:
-        _registry_last_refresh = now
-        try:
-            refreshed: dict[str, str] = {}
-            for tool_info in get_registered_tools():
-                name = tool_info.get("name")
-                declared = tool_info.get("concurrency_class")
-                if isinstance(name, str) and name and isinstance(declared, str):
-                    refreshed[name] = declared
-            _registry_class_by_name.clear()
-            _registry_class_by_name.update(refreshed)
-        except Exception as exc:
-            logger.debug(
-                "operation_gate: registry class refresh failed; keeping previous map: %r",
-                exc,
-            )
+    if now - _registry_last_refresh < _REGISTRY_REFRESH_INTERVAL_SECONDS:
+        return
+    _registry_last_refresh = now
+    try:
+        refreshed: dict[str, str] = {}
+        refreshed_risk: dict[str, bool] = {}
+        for tool_info in get_registered_tools():
+            name = tool_info.get("name")
+            declared = tool_info.get("concurrency_class")
+            if isinstance(name, str) and name and isinstance(declared, str):
+                refreshed[name] = declared
+                refreshed_risk[name] = bool(tool_info.get("compile_risk"))
+        _registry_class_by_name.clear()
+        _registry_class_by_name.update(refreshed)
+        _registry_compile_risk_by_name.clear()
+        _registry_compile_risk_by_name.update(refreshed_risk)
+    except Exception as exc:
+        logger.debug(
+            "operation_gate: registry class refresh failed; keeping previous map: %r",
+            exc,
+        )
+
+
+def _server_declared_class(tool_name: str) -> str | None:
+    _refresh_registry_maps()
     return _registry_class_by_name.get(tool_name)
 
 
-async def _bridge_declared_class(
+async def _bridge_tool_definition(
     tool_name: str,
     unity_instance: str | None,
     user_id: str | None,
-) -> str | None:
-    """Concurrency class from the bridge's register_tools payload, if any."""
+) -> Any | None:
+    """The bridge's register_tools definition for a tool, if any."""
     try:
         from transport.plugin_hub import PluginHub
 
@@ -238,20 +248,68 @@ async def _bridge_declared_class(
             _, _, target_hash = target_hash.rpartition("@")
         if not target_hash:
             return None
-        definition = await PluginHub.get_tool_definition(
+        return await PluginHub.get_tool_definition(
             target_hash, tool_name, user_id=user_id
         )
-        if definition is None:
-            return None
-        declared = getattr(definition, "concurrency_class", None)
-        return declared if isinstance(declared, str) and declared else None
     except Exception as exc:
         logger.debug(
-            "operation_gate: bridge class lookup failed for '%s' (fail-open): %r",
+            "operation_gate: bridge definition lookup failed for '%s' (fail-open): %r",
             tool_name,
             exc,
         )
         return None
+
+
+async def _bridge_declared_class(
+    tool_name: str,
+    unity_instance: str | None,
+    user_id: str | None,
+) -> str | None:
+    """Concurrency class from the bridge's register_tools payload, if any."""
+    definition = await _bridge_tool_definition(tool_name, unity_instance, user_id)
+    if definition is None:
+        return None
+    declared = getattr(definition, "concurrency_class", None)
+    return declared if isinstance(declared, str) and declared else None
+
+
+def definition_compile_risk(definition: Any) -> bool:
+    """Compile-risk for a bridge/custom tool definition.
+
+    An explicit ``compile_risk`` declaration wins. Absent one, mutate- and
+    exclusive-class custom tools fail safe as compile-risk — a project tool
+    that scaffolds scripts or refreshes the AssetDatabase is indistinguishable
+    from one that doesn't — while read/play-scoped ones are not.
+    """
+    declared = getattr(definition, "compile_risk", None)
+    if isinstance(declared, bool):
+        return declared
+    inner = normalize_class(getattr(definition, "concurrency_class", None))
+    return inner in (CLASS_MUTATE, CLASS_EXCLUSIVE)
+
+
+async def resolve_compile_risk(
+    tool_name: str,
+    arguments: Any,
+    unity_instance: str | None = None,
+    user_id: str | None = None,
+) -> bool:
+    """Whether a tool call can trigger a script import / compile.
+
+    Compile risk is an axis orthogonal to the concurrency class: a
+    compile-risk ``mutate`` tool stays a plain mutation everywhere except the
+    running-tests park (where an imported script write would recompile into
+    the run). Server-registered tools carry an explicit annotation; bridge
+    custom tools use :func:`definition_compile_risk` (declaration or the
+    fail-safe default). Tools known to neither registry are not compile-risk.
+    """
+    _refresh_registry_maps()
+    if tool_name in _registry_class_by_name:
+        return _registry_compile_risk_by_name.get(tool_name, False)
+    definition = await _bridge_tool_definition(tool_name, unity_instance, user_id)
+    if definition is not None:
+        return definition_compile_risk(definition)
+    return False
 
 
 async def resolve_tool_class(
@@ -261,6 +319,18 @@ async def resolve_tool_class(
     user_id: str | None = None,
 ) -> str:
     """Resolve a tool call's concurrency class. Unknown tools are mutate."""
+    # The test-run clear/abort lever must never be parked by the very
+    # running_tests state it exists to clear. Mutate keeps ordinary
+    # compile/reload parking while skipping both the tests-running park and
+    # the play-lease owner-only refusal; cross-session safety stays enforced
+    # inside the tool body by test_job_lease.enforce_clear_ownership.
+    if (
+        tool_name == "run_tests"
+        and isinstance(arguments, dict)
+        and arguments.get("clear_stuck")
+    ):
+        return CLASS_MUTATE
+
     overrides = ACTION_CLASS_OVERRIDES.get(tool_name)
     if overrides and isinstance(arguments, dict):
         action = arguments.get("action")
@@ -414,19 +484,70 @@ def _warn_stale_fail_open(
     )
 
 
+def _tests_block_applies(concurrency_class: str, compile_risk: bool) -> bool:
+    """Whether the running-tests park applies to a call of this shape.
+
+    Exclusive (compile-class) calls always park during a test run. Other
+    non-read classes park only when the tool is compile-risk — it can write
+    scripts or import assets whose recompile would destroy the run. Plain
+    mutations without compile risk pass, as before.
+    """
+    if concurrency_class == CLASS_EXCLUSIVE:
+        return True
+    if not compile_risk:
+        return False
+    return concurrency_class not in (CLASS_READ, CLASS_WRAPPER)
+
+
+def _test_job_owner_display(unity_instance: str | None) -> str | None:
+    """Display name of the active test job's owner, if any (fail-open)."""
+    try:
+        from services.state.test_job_lease import test_job_lease_manager
+
+        owned = test_job_lease_manager.get_active(unity_instance)
+        return owned.owner_display if owned is not None else None
+    except Exception:
+        return None
+
+
+def _running_tests_owner(
+    tests: dict[str, Any],
+    unity_instance: str | None,
+    edge_owner: str | None,
+) -> str | None:
+    """Best owner attribution for a running_tests block.
+
+    The bridge snapshot's ``tests.started_by`` wins when it names a real
+    label; older bridges hardcode ``"unknown"`` (or omit the field), which
+    must not shadow the server's own attribution — fall back to the test-job
+    lease owner, then the exclusive-edge owner.
+    """
+    owner = tests.get("started_by")
+    if isinstance(owner, str) and owner and owner.strip().lower() != "unknown":
+        return owner
+    return _test_job_owner_display(unity_instance) or edge_owner
+
+
 def _editor_block(
     state: dict[str, Any] | None,
     concurrency_class: str,
     unity_instance: str | None,
+    compile_risk: bool = False,
 ) -> tuple[str, str | None] | None:
     """(reason, owner) when the editor state blocks this class, else None.
 
-    A missing snapshot (cache miss) never blocks — the gate fails open. A
-    transition-class blocking state that has persisted past the stale ceiling
-    is skipped (fail open, with a warning); fresher blocking states in the
-    same snapshot still park.
+    A missing snapshot (cache miss) never blocks on editor-reported state —
+    the gate fails open — but the server-local tests-pending marker (a
+    just-dispatched run whose snapshot has not caught up) still parks
+    compile-risk calls. A transition-class blocking state that has persisted
+    past the stale ceiling is skipped (fail open, with a warning); fresher
+    blocking states in the same snapshot still park.
     """
     if not isinstance(state, dict):
+        if _tests_block_applies(concurrency_class, compile_risk):
+            pending = editor_state_cache.tests_pending(unity_instance)
+            if pending is not None:
+                return ("running_tests", pending.owner)
         return None
 
     compilation = state.get("compilation") or {}
@@ -436,6 +557,12 @@ def _editor_block(
 
     edge_owner = editor_state_cache.get_exclusive_edge_owner(unity_instance)
 
+    tests_running = tests.get("is_running") is True
+    if tests_running:
+        # The bridge snapshot has caught up with a dispatched run; the
+        # optimistic marker has served its purpose.
+        editor_state_cache.clear_tests_pending(unity_instance)
+
     candidates: list[tuple[str, str | None]] = []
     if compilation.get("is_compiling") is True:
         candidates.append(("compiling", edge_owner))
@@ -443,13 +570,19 @@ def _editor_block(
         candidates.append(("domain_reload", edge_owner))
     if play_mode.get("is_changing") is True:
         candidates.append(("play_mode_transition", edge_owner))
-    # Test runs park only compile-class (exclusive) operations: script state
-    # on disk cannot affect an in-flight run until a recompile picks it up.
-    if tests.get("is_running") is True and concurrency_class == CLASS_EXCLUSIVE:
-        owner = tests.get("started_by")
-        candidates.append(
-            ("running_tests", owner if isinstance(owner, str) and owner else edge_owner)
-        )
+    # Test runs park compile-class (exclusive) operations and compile-risk
+    # tools of any non-read class: plain script/asset state on disk cannot
+    # affect an in-flight run until a recompile or import picks it up, and
+    # compile-risk tools are exactly the ones that can trigger that pickup.
+    if _tests_block_applies(concurrency_class, compile_risk):
+        if tests_running:
+            candidates.append(
+                ("running_tests", _running_tests_owner(tests, unity_instance, edge_owner))
+            )
+        else:
+            pending = editor_state_cache.tests_pending(unity_instance)
+            if pending is not None:
+                candidates.append(("running_tests", pending.owner or edge_owner))
 
     # Track how long each transition-class reason has been continuously
     # observed (also clears records for reasons no longer present).
@@ -617,12 +750,15 @@ async def gate_for_class(
     concurrency_class: str,
     tool_name: str,
     unity_instance: str | None,
+    compile_risk: bool = False,
 ) -> dict[str, Any] | None:
     """Park an operation of the given class until the editor admits it.
 
     Returns ``None`` when the call may proceed, or a structured busy payload
     (success=False, hint=retry, owner attribution) once the park budget is
     exhausted. Reads pass immediately; every internal failure fails open.
+    ``compile_risk`` extends the running-tests park to non-exclusive tools
+    that can trigger a script import / compile.
     """
     concurrency_class = (
         concurrency_class
@@ -648,7 +784,9 @@ async def gate_for_class(
             logger.debug("operation_gate: state read failed (fail-open): %r", exc)
             state = None
         try:
-            block = _editor_block(state, concurrency_class, unity_instance)
+            block = _editor_block(
+                state, concurrency_class, unity_instance, compile_risk
+            )
         except Exception as exc:
             logger.debug("operation_gate: block check failed (fail-open): %r", exc)
             block = None
@@ -730,7 +868,15 @@ async def gate_tool_call(ctx, tool_name: str, arguments: Any) -> dict[str, Any] 
             tool_name, arguments, unity_instance, user_id
         )
         await _record_activity(ctx, concurrency_class)
-        return await gate_for_class(ctx, concurrency_class, tool_name, unity_instance)
+        compile_risk = False
+        if concurrency_class in (CLASS_MUTATE, CLASS_PLAY_SCOPED):
+            compile_risk = await resolve_compile_risk(
+                tool_name, arguments, unity_instance, user_id
+            )
+        return await gate_for_class(
+            ctx, concurrency_class, tool_name, unity_instance,
+            compile_risk=compile_risk,
+        )
     except Exception as exc:
         logger.debug("operation_gate: gate failed open for '%s': %r", tool_name, exc)
         return None

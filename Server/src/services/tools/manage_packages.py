@@ -53,6 +53,7 @@ async def _send_packages_command(
         readOnlyHint=False,
     ),
     concurrency_class="exclusive",
+    compile_risk=True,
 )
 async def manage_packages(
     ctx: Context,

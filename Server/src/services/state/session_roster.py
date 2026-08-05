@@ -61,6 +61,17 @@ HOOK_ACTIVE_RECENCY_SECONDS = 45.0
 # Window for the intent-stale flag's "activity continues" signal.
 INTENT_ACTIVITY_RECENCY_SECONDS = 120.0
 
+# How long the roster must have been continuously empty (while healthy and a
+# bridge is connected) before an empty-sessions push is published. Transient
+# identity gaps (TTL eviction races, momentary no-live-identity windows)
+# resolve within a heartbeat or two; a genuine "all agents gone" transition
+# outlives the debounce and must render on the dashboard.
+EMPTY_ROSTER_DEBOUNCE_SECONDS = 10.0
+
+# Throttle for repeated roster-build failure warnings.
+_BUILD_FAIL_WARN_INTERVAL_SECONDS = 30.0
+_build_fail_last_warn = 0.0
+
 # States that are themselves activity for the intent-stale "activity_recent"
 # signal (a parked or running call is ongoing work).
 _ACTIVE_STATES = frozenset(
@@ -165,10 +176,22 @@ def _derive_intent(agent_status, source_is_full: bool) -> str | None:
 
 def build_roster() -> dict[str, Any]:
     """Assemble the full roster envelope. Pure; never raises (fails open)."""
+    global _build_fail_last_warn
     try:
         return _build_roster_inner()
     except Exception as exc:
         logger.debug("session_roster: build failed open: %r", exc)
+        # A persistent build failure silently freezes the dashboard (its
+        # empty fail-open envelope is suppressed by the publisher), so
+        # escalate to a throttled warning naming the exception.
+        now = time.monotonic()
+        if now - _build_fail_last_warn >= _BUILD_FAIL_WARN_INTERVAL_SECONDS:
+            _build_fail_last_warn = now
+            logger.warning(
+                "session_roster: roster build failing (dashboard frozen at "
+                "last good snapshot): %r",
+                exc,
+            )
         return {
             "type": ROSTER_MESSAGE_TYPE,
             "schema": ROSTER_SCHEMA,
@@ -202,9 +225,11 @@ def _build_roster_inner() -> dict[str, Any]:
 
     # Collect known play leases / test jobs across instances so we can attribute
     # them to a session key. Both are keyed by project_hash; both carry the
-    # owning MCP session key (None for the "user" play owner).
-    play_leases = list(getattr(play_lease_manager, "_leases", {}).values())
-    test_jobs = list(getattr(test_job_lease_manager, "_owned", {}).values())
+    # owning MCP session key (None for the "user" play owner). Read through the
+    # expiry-aware snapshot accessors (pure reads — they never release) so the
+    # dashboard shows only leases/jobs the enforcement paths would still honor.
+    play_leases = play_lease_manager.active_leases()
+    test_jobs = test_job_lease_manager.active_jobs()
 
     play_owner_keys = {
         lease.owner_key for lease in play_leases if lease.owner_key is not None
@@ -327,10 +352,11 @@ def _build_roster_inner() -> dict[str, Any]:
             }
         )
 
-    # Play-lease envelope summary (banner): the first/most relevant active lease.
+    # Play-lease envelope summary (banner): the most recently active lease
+    # (deterministic across instances, unlike dict insertion order).
     play_lease_summary = None
     if play_leases:
-        lease = play_leases[0]
+        lease = max(play_leases, key=lambda entry: entry.last_activity)
         play_lease_summary = {
             "owner": lease.owner_display,
             "owner_session_key": lease.owner_key,
@@ -387,12 +413,14 @@ class RosterPublisher:
     def __init__(self) -> None:
         self._last_fingerprint: str | None = None
         self._last_push_mono: float = 0.0
+        self._empty_since_mono: float | None = None
         self._lock = RLock()
 
     def reset(self) -> None:
         with self._lock:
             self._last_fingerprint = None
             self._last_push_mono = 0.0
+            self._empty_since_mono = None
         _intent_tracker.reset()
 
     async def maybe_push(self, force: bool = False) -> bool:
@@ -406,15 +434,28 @@ class RosterPublisher:
             fingerprint = _roster_fingerprint(roster)
             now = time.monotonic()
             with self._lock:
-                # Suppress an empty-sessions roster while a bridge is connected: it is
-                # almost always a transient identity gap (TTL eviction race, momentary
-                # no-live-identity window), not a real "all agents gone" event, and would
-                # clobber a good snapshot on the dashboard. Skip without recording the
-                # fingerprint so the next genuine non-empty roster still counts as
-                # changed and pushes. force=True (on-register push, deliberate empty)
+                # Debounce an empty-sessions roster while a bridge is connected:
+                # a brief empty window is almost always a transient identity gap
+                # (TTL eviction race, momentary no-live-identity window) that
+                # would clobber a good snapshot on the dashboard — but a roster
+                # that stays empty past the debounce is a genuine "all agents
+                # gone" transition and must render. A failed build's fail-open
+                # envelope (health.ok False) is never published: it carries no
+                # information the last good snapshot lacks. Suppressed pushes do
+                # not record the fingerprint, so the next genuine change still
+                # pushes. force=True (on-register push, deliberate empty)
                 # bypasses the guard.
-                if not force and not roster.get("sessions") and _has_connected_bridge():
-                    return False
+                sessions_empty = not roster.get("sessions")
+                if not sessions_empty:
+                    self._empty_since_mono = None
+                if not force and sessions_empty and _has_connected_bridge():
+                    healthy = bool((roster.get("health") or {}).get("ok"))
+                    if not healthy:
+                        return False
+                    if self._empty_since_mono is None:
+                        self._empty_since_mono = now
+                    if (now - self._empty_since_mono) < EMPTY_ROSTER_DEBOUNCE_SECONDS:
+                        return False
                 changed = fingerprint != self._last_fingerprint
                 heartbeat_due = (now - self._last_push_mono) >= _heartbeat_s()
                 if not force and not changed and not heartbeat_due:

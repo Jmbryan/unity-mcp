@@ -69,6 +69,7 @@ def _split_uri(uri: str) -> tuple[str, str]:
 
 
 @mcp_for_unity_tool(
+    compile_risk=True,
     unity_target="manage_script",
     description=(
         """Apply small text edits to a C# script identified by URI.
@@ -382,6 +383,7 @@ async def apply_text_edits(
 
 
 @mcp_for_unity_tool(
+    compile_risk=True,
     unity_target="manage_script",
     description="Create a new C# script at the given project path.",
     annotations=ToolAnnotations(
@@ -440,6 +442,7 @@ async def create_script(
 
 
 @mcp_for_unity_tool(
+    compile_risk=True,
     unity_target="manage_script",
     description="Delete a C# script by URI or Assets-relative path.",
     annotations=ToolAnnotations(
@@ -527,6 +530,7 @@ async def validate_script(
 
 
 @mcp_for_unity_tool(
+    compile_risk=True,
     description="Compatibility router for legacy script operations. Prefer apply_text_edits (ranges) or script_apply_edits (structured) for edits. Read-only action: read. Modifying actions: create, delete.",
     annotations=ToolAnnotations(
         title="Manage Script",

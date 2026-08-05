@@ -119,6 +119,19 @@ class TestJobLeaseManager:
                 return None
             return owned
 
+    def active_jobs(self) -> list[TestJobOwnership]:
+        """Expiry-aware snapshot of all owned jobs (pure read; never releases).
+
+        Applies the same inactivity-TTL filter as :meth:`get_active` without
+        mutating state, so roster/banner views show only ownership the guard
+        would still honor.
+        """
+        now = time.monotonic()
+        ttl = _test_job_ttl_s()
+        with self._lock:
+            owned = list(self._owned.values())
+        return [job for job in owned if (now - job.last_activity) <= ttl]
+
     def record(
         self,
         unity_instance: str | None,

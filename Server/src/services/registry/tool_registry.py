@@ -45,6 +45,7 @@ def mcp_for_unity_tool(
     unity_target: str | None = "self",
     group: str | None = "core",
     concurrency_class: str | None = None,
+    compile_risk: bool = False,
     **kwargs
 ) -> Callable:
     """
@@ -69,6 +70,11 @@ def mcp_for_unity_tool(
             during test runs and by the compile fence), "play-scoped"
             (mutates a running play session), or "wrapper" (effective class is
             computed inside the tool body). None means the default ("mutate").
+        compile_risk: True for tools that can trigger a script import /
+            compile (script writes, asset imports, arbitrary code, menu
+            items). Orthogonal to the concurrency class: the operation gate
+            parks compile-risk calls during test runs regardless of class,
+            while leaving their behavior elsewhere unchanged.
         **kwargs: Additional arguments passed to @mcp.tool()
 
     Example:
@@ -86,6 +92,8 @@ def mcp_for_unity_tool(
             del tool_kwargs["group"]
         if "concurrency_class" in tool_kwargs:
             del tool_kwargs["concurrency_class"]
+        if "compile_risk" in tool_kwargs:
+            del tool_kwargs["compile_risk"]
 
         # Validate and normalize concurrency class
         resolved_class = (
@@ -132,6 +140,7 @@ def mcp_for_unity_tool(
             'unity_target': normalized_unity_target,
             'group': resolved_group,
             'concurrency_class': resolved_class,
+            'compile_risk': bool(compile_risk),
             'kwargs': tool_kwargs,
         })
 

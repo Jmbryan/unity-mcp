@@ -24,6 +24,28 @@ def _busy(reason: str, retry_after_ms: int) -> MCPResponse:
     )
 
 
+def _tests_running(data: dict) -> bool:
+    tests = data.get("tests")
+    return isinstance(tests, dict) and tests.get("is_running") is True
+
+
+def _defer_span_active(data: dict) -> bool:
+    """True while a test run or play session holds the editor's defer span.
+
+    During either span the bridge defers compiles, so an asset refresh buys
+    nothing — and would synchronously import script writes the defer funnel
+    is deliberately holding, recompiling into the running span.
+    """
+    if _tests_running(data):
+        return True
+    play_mode = (data.get("editor") or {}).get("play_mode")
+    if isinstance(play_mode, dict) and (
+        play_mode.get("is_playing") is True or play_mode.get("is_changing") is True
+    ):
+        return True
+    return False
+
+
 async def preflight(
     ctx,
     *,
@@ -60,8 +82,16 @@ async def preflight(
     if not isinstance(data, dict):
         return None
 
-    # Optional refresh-if-dirty
-    if refresh_if_dirty:
+    # Tests running: fail fast for tools that require exclusivity. Checked
+    # BEFORE any side-effectful refresh so the guard can never fire a refresh
+    # into the very run it is rejecting.
+    if requires_no_tests and _tests_running(data):
+        return _busy("tests_running", 5000)
+
+    # Optional refresh-if-dirty — never while a test run or play session is
+    # active (see _defer_span_active): the refresh would import held script
+    # writes and trigger a compile inside the protected span.
+    if refresh_if_dirty and not _defer_span_active(data):
         assets = data.get("assets")
         if isinstance(assets, dict) and assets.get("external_changes_dirty") is True:
             try:
@@ -70,12 +100,6 @@ async def preflight(
             except Exception:
                 # Best-effort only; fall through to normal tool dispatch.
                 pass
-
-    # Tests running: fail fast for tools that require exclusivity.
-    if requires_no_tests:
-        tests = data.get("tests")
-        if isinstance(tests, dict) and tests.get("is_running") is True:
-            return _busy("tests_running", 5000)
 
     # Compilation: optionally wait for a bounded time.
     if wait_for_no_compile:

@@ -13,11 +13,15 @@ from services.registry import mcp_for_unity_tool
 from services.state.operation_gate import (
     CLASS_EXCLUSIVE,
     CLASS_PLAY_SCOPED,
+    definition_compile_risk,
     gate_for_class,
     normalize_class,
     record_exclusive_edge_after_arbitrary_code,
 )
-from services.state.play_lease import record_play_intent_for_session
+from services.state.play_lease import (
+    clear_play_intent_for_session,
+    record_play_intent_for_session,
+)
 from services.tools import get_unity_instance_from_context
 
 
@@ -79,8 +83,18 @@ async def execute_custom_tool(ctx: Context, tool_name: str, parameters: dict[str
         await record_play_intent_for_session(ctx, unity_instance)
 
     if definition is not None:
-        busy = await gate_for_class(ctx, inner_class, tool_name, unity_instance)
+        busy = await gate_for_class(
+            ctx,
+            inner_class,
+            tool_name,
+            unity_instance,
+            compile_risk=definition_compile_risk(definition),
+        )
         if busy is not None:
+            # The refused call never dispatches: drop the speculative intent
+            # so it cannot misattribute whatever play transition happens next.
+            if is_play_scoped:
+                await clear_play_intent_for_session(ctx, unity_instance)
             return MCPResponse(**busy)
 
     result = await service.execute_tool(

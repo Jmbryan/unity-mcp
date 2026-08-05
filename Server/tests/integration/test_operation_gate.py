@@ -834,6 +834,34 @@ class TestCustomToolUnwrap:
         assert result.data["blocked_by"] == "Aurora"
 
     @pytest.mark.asyncio
+    async def test_refused_custom_tool_leaves_no_stale_intent(
+        self, monkeypatch, custom_tool_service,
+    ):
+        """A gate-refused play-scoped custom tool must not leak its
+        speculative play intent into the next unrelated play-enter."""
+        from services.state.play_lease import play_lease_manager
+
+        play_lease_manager.reset()
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        _inject_state(monkeypatch, FakeEditorState(COMPILING_STATE))
+        tool_mod, executed = self._setup_custom(
+            monkeypatch, custom_tool_service,
+            ToolDefinitionModel(name="ui_driver", concurrency_class="play-scoped"),
+        )
+
+        ctx = GateContext()
+        await ctx.set_state("unity_instance", "Game@hash-x")
+        try:
+            result = await tool_mod.execute_custom_tool(ctx, "ui_driver", {})
+        finally:
+            intents = dict(play_lease_manager._intents)
+            play_lease_manager.reset()
+
+        assert "tool_name" not in executed
+        assert result.success is False
+        assert intents == {}
+
+    @pytest.mark.asyncio
     async def test_read_custom_tool_passes_during_tests(
         self, monkeypatch, custom_tool_service,
     ):
@@ -971,3 +999,277 @@ class TestMiddlewareGate:
         result = await middleware.on_call_tool(context, call_next)
 
         assert result == "tool-ran"
+
+
+# ----------------------------------------------------------------------
+# clear_stuck escapes the running_tests park (test-wedge fix)
+# ----------------------------------------------------------------------
+class TestClearStuckGate:
+    @pytest.mark.asyncio
+    async def test_clear_stuck_classified_mutate(self):
+        assert await resolve_tool_class(
+            "run_tests", {"clear_stuck": True}) == CLASS_MUTATE
+        assert await resolve_tool_class(
+            "run_tests", {"mode": "EditMode"}) == CLASS_EXCLUSIVE
+
+    @pytest.mark.asyncio
+    async def test_clear_stuck_passes_during_running_tests(self, monkeypatch):
+        """The un-wedge lever must reach the bridge while tests.is_running is
+        (possibly wedged) true; ownership stays enforced in the tool body."""
+        fake = FakeEditorState(TESTING_STATE)
+        _inject_state(monkeypatch, fake)
+
+        ctx = GateContext()
+        result = await gate_tool_call(ctx, "run_tests", {"clear_stuck": True})
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_plain_run_tests_still_parks_during_running_tests(self, monkeypatch):
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        fake = FakeEditorState(TESTING_STATE)
+        _inject_state(monkeypatch, fake)
+        _no_fence(monkeypatch)
+
+        ctx = GateContext()
+        result = await gate_tool_call(ctx, "run_tests", {"mode": "EditMode"})
+
+        assert result is not None
+        assert result["data"]["reason"] == "running_tests"
+
+    @pytest.mark.asyncio
+    async def test_clear_stuck_still_parks_during_compile(self, monkeypatch):
+        """Mutate semantics preserved: compile/domain-reload parking applies."""
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        fake = FakeEditorState(COMPILING_STATE)
+        _inject_state(monkeypatch, fake)
+
+        ctx = GateContext()
+        result = await gate_tool_call(ctx, "run_tests", {"clear_stuck": True})
+
+        assert result is not None
+        assert result["data"]["reason"] == "compiling"
+
+
+# ----------------------------------------------------------------------
+# Compile-risk tools park during test runs (compile-gate fix)
+# ----------------------------------------------------------------------
+class TestCompileRiskGate:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool_name,arguments", [
+        ("manage_script", {"action": "create"}),
+        ("create_script", {"path": "Assets/Scripts/Foo.cs"}),
+        ("delete_script", {"uri": "Assets/Scripts/Foo.cs"}),
+        ("apply_text_edits", {"uri": "Assets/Scripts/Foo.cs"}),
+        ("script_apply_edits", {"name": "Foo"}),
+        ("execute_code", {"action": "execute", "code": "return 1;"}),
+        ("execute_menu_item", {"menu_path": "Assets/Refresh"}),
+        ("manage_asset", {"action": "create_folder"}),
+    ])
+    async def test_compile_risk_mutate_parks_during_tests(
+        self, monkeypatch, tool_name, arguments,
+    ):
+        import services.tools.execute_code  # noqa: F401
+        import services.tools.execute_menu_item  # noqa: F401
+        import services.tools.manage_asset  # noqa: F401
+        import services.tools.manage_script  # noqa: F401
+        import services.tools.script_apply_edits  # noqa: F401
+
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        _inject_state(monkeypatch, FakeEditorState(TESTING_STATE))
+        _no_fence(monkeypatch)
+
+        ctx = GateContext()
+        result = await gate_tool_call(ctx, tool_name, arguments)
+
+        assert result is not None, tool_name
+        assert result["data"]["reason"] == "running_tests"
+        assert result["data"]["blocked_by"] == "Aurora"
+
+    @pytest.mark.asyncio
+    async def test_read_action_of_compile_risk_tool_passes(self, monkeypatch):
+        import services.tools.manage_asset  # noqa: F401
+        import services.tools.manage_script  # noqa: F401
+
+        _inject_state(monkeypatch, FakeEditorState(TESTING_STATE))
+
+        ctx = GateContext()
+        assert await gate_tool_call(ctx, "manage_asset", {"action": "search"}) is None
+        assert await gate_tool_call(ctx, "manage_script", {"action": "read"}) is None
+
+    @pytest.mark.asyncio
+    async def test_plain_mutate_still_passes_during_tests(self, monkeypatch):
+        _inject_state(monkeypatch, FakeEditorState(TESTING_STATE))
+
+        ctx = GateContext()
+        result = await gate_tool_call(ctx, "manage_gameobject", {"action": "create"})
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_compile_risk_mutate_passes_during_anothers_play_session(
+        self, monkeypatch,
+    ):
+        """Compile-risk is not exclusive: during another agent's play-mode
+        session (bridge defer covers safety) script writes stay usable."""
+        import services.tools.manage_script  # noqa: F401
+        from services.state.play_lease import play_lease_manager
+
+        play_lease_manager.reset()
+        _inject_state(monkeypatch, FakeEditorState(
+            {"compilation": {}, "editor": {"play_mode": {"is_playing": True, "is_changing": False}}, "tests": {}}))
+
+        ctx_b = GateContext()
+        await ctx_b.set_state("unity_instance", "Game@hash-x")
+        play_lease_manager.acquire("Game@hash-x", "someone-else", "AgentA")
+        try:
+            result = await gate_tool_call(
+                ctx_b, "manage_script", {"action": "create"})
+        finally:
+            play_lease_manager.reset()
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_bridge_custom_tool_defaults_to_compile_risk(self, monkeypatch):
+        """Bridge-registered mutate tools without a declaration fail safe."""
+        from services.state.operation_gate import resolve_compile_risk
+
+        registry = PluginRegistry()
+        PluginHub.configure(registry, asyncio.get_running_loop())
+        await registry.register("guid-1", "Game", "hash-x", "6000.0")
+        await registry.register_tools_for_session("guid-1", [
+            ToolDefinitionModel(name="enemy_creator", concurrency_class="mutate"),
+            ToolDefinitionModel(
+                name="npc_wander", concurrency_class="mutate", compile_risk=False),
+            ToolDefinitionModel(name="scene_probe", concurrency_class="read"),
+        ])
+
+        assert await resolve_compile_risk("enemy_creator", {}, "Game@hash-x") is True
+        assert await resolve_compile_risk("npc_wander", {}, "Game@hash-x") is False
+        assert await resolve_compile_risk("scene_probe", {}, "Game@hash-x") is False
+
+    @pytest.mark.asyncio
+    async def test_undeclared_bridge_mutate_tool_parks_during_tests(self, monkeypatch):
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        _inject_state(monkeypatch, FakeEditorState(TESTING_STATE))
+
+        registry = PluginRegistry()
+        PluginHub.configure(registry, asyncio.get_running_loop())
+        await registry.register("guid-1", "Game", "hash-x", "6000.0")
+        await registry.register_tools_for_session("guid-1", [
+            ToolDefinitionModel(name="enemy_creator", concurrency_class="mutate"),
+        ])
+
+        ctx = GateContext()
+        await ctx.set_state("unity_instance", "Game@hash-x")
+        result = await gate_tool_call(ctx, "enemy_creator", {})
+
+        assert result is not None
+        assert result["data"]["reason"] == "running_tests"
+
+    @pytest.mark.asyncio
+    async def test_started_by_unknown_falls_back_to_job_lease_owner(self, monkeypatch):
+        """The bridge's hardcoded 'unknown' must not shadow the server's own
+        test-job attribution."""
+        from services.state.test_job_lease import test_job_lease_manager
+
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        _inject_state(monkeypatch, FakeEditorState(
+            {"tests": {"is_running": True, "started_by": "unknown"}}))
+        _no_fence(monkeypatch)
+        test_job_lease_manager.reset()
+        test_job_lease_manager.record("Game@hash-x", "job-1", "sess-t", "Basalt")
+
+        ctx = GateContext()
+        await ctx.set_state("unity_instance", "Game@hash-x")
+        try:
+            result = await gate_tool_call(ctx, "refresh_unity", {})
+        finally:
+            test_job_lease_manager.reset()
+
+        assert result is not None
+        assert result["data"]["reason"] == "running_tests"
+        assert result["data"]["blocked_by"] == "Basalt"
+
+
+# ----------------------------------------------------------------------
+# Tests-pending marker (dispatch -> snapshot race fix)
+# ----------------------------------------------------------------------
+class TestTestsPendingMarker:
+    @pytest.mark.asyncio
+    async def test_marker_parks_exclusive_before_snapshot_confirms(self, monkeypatch):
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        _inject_state(monkeypatch, FakeEditorState(IDLE_STATE))
+        _no_fence(monkeypatch)
+        editor_state_cache.mark_tests_pending("Game@hash-x", "Aurora")
+
+        ctx = GateContext()
+        await ctx.set_state("unity_instance", "Game@hash-x")
+        result = await gate_tool_call(ctx, "refresh_unity", {})
+
+        assert result is not None
+        assert result["data"]["reason"] == "running_tests"
+        assert result["data"]["blocked_by"] == "Aurora"
+
+    @pytest.mark.asyncio
+    async def test_marker_parks_compile_risk_mutate(self, monkeypatch):
+        import services.tools.manage_script  # noqa: F401
+
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        _inject_state(monkeypatch, FakeEditorState(IDLE_STATE))
+        editor_state_cache.mark_tests_pending("Game@hash-x", "Aurora")
+
+        ctx = GateContext()
+        await ctx.set_state("unity_instance", "Game@hash-x")
+        result = await gate_tool_call(ctx, "manage_script", {"action": "create"})
+
+        assert result is not None
+        assert result["data"]["reason"] == "running_tests"
+
+    @pytest.mark.asyncio
+    async def test_marker_does_not_park_plain_mutate_or_read(self, monkeypatch):
+        _inject_state(monkeypatch, FakeEditorState(IDLE_STATE))
+        editor_state_cache.mark_tests_pending("Game@hash-x", "Aurora")
+
+        ctx = GateContext()
+        await ctx.set_state("unity_instance", "Game@hash-x")
+        assert await gate_tool_call(
+            ctx, "manage_gameobject", {"action": "create"}) is None
+        assert await gate_tool_call(ctx, "read_console", {"action": "get"}) is None
+
+    @pytest.mark.asyncio
+    async def test_expired_marker_fails_open(self, monkeypatch):
+        from services.state import editor_state_cache as cache_mod
+
+        _inject_state(monkeypatch, FakeEditorState(IDLE_STATE))
+        _no_fence(monkeypatch)
+        editor_state_cache.mark_tests_pending("Game@hash-x", "Aurora")
+        marker = editor_state_cache._tests_pending["Game@hash-x"]
+        monkeypatch.setattr(
+            marker, "recorded_at",
+            time.monotonic() - (cache_mod.TESTS_PENDING_TTL_SECONDS + 1.0))
+
+        ctx = GateContext()
+        await ctx.set_state("unity_instance", "Game@hash-x")
+        result = await gate_tool_call(ctx, "refresh_unity", {})
+
+        assert result is None
+        assert editor_state_cache.tests_pending("Game@hash-x") is None
+
+    @pytest.mark.asyncio
+    async def test_confirming_snapshot_clears_marker(self, monkeypatch):
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        _inject_state(monkeypatch, FakeEditorState(TESTING_STATE))
+        _no_fence(monkeypatch)
+        editor_state_cache.mark_tests_pending("Game@hash-x", "Aurora")
+
+        ctx = GateContext()
+        await ctx.set_state("unity_instance", "Game@hash-x")
+        result = await gate_tool_call(ctx, "refresh_unity", {})
+
+        # The real tests.is_running flag now carries the block; the
+        # optimistic marker has been consumed.
+        assert result is not None
+        assert result["data"]["reason"] == "running_tests"
+        assert editor_state_cache.tests_pending("Game@hash-x") is None

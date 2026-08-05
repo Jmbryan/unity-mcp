@@ -51,6 +51,12 @@ FETCH_TIMEOUT_SECONDS = 5.0
 # Exclusive-edge ownership records expire on their own; there is no cleanup.
 EDGE_TTL_SECONDS = 30.0
 
+# Lifetime of an optimistic "tests pending" marker pinned when a test run is
+# dispatched, bridging the window before the bridge snapshot publishes
+# ``tests.is_running``. Cleared early once a snapshot confirms the run; the
+# TTL is only the backstop for a dispatch whose run never materializes.
+TESTS_PENDING_TTL_SECONDS = 15.0
+
 # Maximum gap between observations of the same blocking reason for the
 # persistence record to stay continuous. Parked calls poll on a sub-second
 # cadence and busy-retry loops re-poll within ~1s, so anything beyond this
@@ -78,6 +84,12 @@ class _BlockingObservation:
     last_observed: float  # time.monotonic()
 
 
+@dataclass
+class TestsPending:
+    owner: str | None
+    recorded_at: float  # time.monotonic()
+
+
 def _instance_key(unity_instance: str | None) -> str:
     return unity_instance or "default"
 
@@ -90,6 +102,7 @@ class EditorStateCache:
         self._entries: dict[str, _CacheEntry] = {}
         self._edges: dict[str, _ExclusiveEdge] = {}
         self._blocking: dict[str, dict[str, _BlockingObservation]] = {}
+        self._tests_pending: dict[str, TestsPending] = {}
         # Per-instance edge-event signals (MCPC-030). A pushed editor-edge
         # event sets the instance's asyncio.Event so any park loop awaiting it
         # wakes immediately instead of waiting out its bounded poll. The signal
@@ -103,6 +116,7 @@ class EditorStateCache:
         self._entries.clear()
         self._edges.clear()
         self._blocking.clear()
+        self._tests_pending.clear()
         self._event_signals.clear()
         if ttl_s is not None:
             self._ttl_s = float(ttl_s)
@@ -196,6 +210,39 @@ class EditorStateCache:
             self._edges.pop(key, None)
             return None
         return edge.owner
+
+    # ------------------------------------------------------------------
+    # Tests-pending marker (dispatch -> snapshot race bridging)
+    # ------------------------------------------------------------------
+    def mark_tests_pending(
+        self,
+        unity_instance: str | None,
+        owner: str | None = None,
+    ) -> None:
+        """Pin an optimistic "a test run was just dispatched" marker.
+
+        Compile-risk gate checks treat the marker as ``running_tests`` until
+        a snapshot confirms the run (which clears it) or the marker's TTL
+        elapses — closing the 1-2s window between the run_tests dispatch and
+        ``tests.is_running`` becoming visible in the shared snapshot.
+        """
+        self._tests_pending[_instance_key(unity_instance)] = TestsPending(
+            owner=owner, recorded_at=time.monotonic()
+        )
+
+    def clear_tests_pending(self, unity_instance: str | None) -> None:
+        self._tests_pending.pop(_instance_key(unity_instance), None)
+
+    def tests_pending(self, unity_instance: str | None) -> TestsPending | None:
+        """The unexpired tests-pending marker for an instance, if any."""
+        key = _instance_key(unity_instance)
+        pending = self._tests_pending.get(key)
+        if pending is None:
+            return None
+        if (time.monotonic() - pending.recorded_at) > TESTS_PENDING_TTL_SECONDS:
+            self._tests_pending.pop(key, None)
+            return None
+        return pending
 
     # ------------------------------------------------------------------
     # Blocking-state persistence (phantom-transition detection support)

@@ -20,6 +20,7 @@ from transport.legacy.unity_connection import async_send_command_with_retry
 
 
 @mcp_for_unity_tool(
+    compile_risk=True,
     description=(
         "Execute arbitrary C# code inside the Unity Editor. "
         "The code runs as a method body with access to UnityEngine and UnityEditor namespaces. "

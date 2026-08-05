@@ -130,6 +130,10 @@ class PlayLeaseManager:
     def __init__(self) -> None:
         self._leases: dict[str, PlayLease] = {}
         self._intents: dict[str, _PlayIntent] = {}
+        # Instances whose fall-through "user" acquisition is suppressed after a
+        # human force-release: the override must stick until play actually
+        # exits or a real MCP cause (intent / explicit acquire) appears.
+        self._user_suppressed: dict[str, float] = {}
         self._lock = RLock()
 
     def reset(self) -> None:
@@ -137,6 +141,7 @@ class PlayLeaseManager:
         with self._lock:
             self._leases.clear()
             self._intents.clear()
+            self._user_suppressed.clear()
 
     # ------------------------------------------------------------------
     # Core lease operations
@@ -160,6 +165,53 @@ class PlayLeaseManager:
                 return None
             return lease
 
+    def peek_lease(self, unity_instance: str | None) -> PlayLease | None:
+        """The instance's lease, applying only disconnect-grace expiry (not TTL).
+
+        Used by the observation path: a snapshot proving play is still active
+        renews the lease regardless of how stale its inactivity clock is, so
+        TTL expiry can never flip a mid-play lease to the fall-through "user"
+        owner. Disconnect grace still applies — an editor that vanished frees
+        its lease at the boundary.
+        """
+        key = instance_key(unity_instance)
+        with self._lock:
+            lease = self._leases.get(key)
+            if lease is None:
+                return None
+            if (
+                lease.disconnected_at is not None
+                and (time.monotonic() - lease.disconnected_at)
+                > DISCONNECT_GRACE_SECONDS
+            ):
+                self._release_locked(key, lease, reason="instance_disconnected")
+                return None
+            return lease
+
+    def active_leases(self) -> list[PlayLease]:
+        """Expiry-aware snapshot of all leases (pure read; never releases).
+
+        Applies the same TTL and disconnect-grace filters as
+        :meth:`get_active_lease` without mutating state, so a roster/banner
+        view cannot release a lease out from under the enforcement and
+        observation paths.
+        """
+        now = time.monotonic()
+        ttl = _play_lease_ttl_s()
+        with self._lock:
+            leases = list(self._leases.values())
+        surviving: list[PlayLease] = []
+        for lease in leases:
+            if (now - lease.last_activity) > ttl:
+                continue
+            if (
+                lease.disconnected_at is not None
+                and (now - lease.disconnected_at) > DISCONNECT_GRACE_SECONDS
+            ):
+                continue
+            surviving.append(lease)
+        return surviving
+
     def acquire(
         self,
         unity_instance: str | None,
@@ -169,14 +221,23 @@ class PlayLeaseManager:
     ) -> PlayLease:
         """Acquire (or renew, for the same owner) the instance's lease.
 
-        Never steals: when another owner's lease is still active, that lease
-        is returned untouched.
+        Never steals between two real MCP owners: when another session's lease
+        is still active, that lease is returned untouched. An *inferred*
+        ``"user"`` lease (``owner_key is None`` — the fall-through guess made
+        when no MCP cause was known) is not protected the same way: a caller
+        with a proven session identity corrects it in place, so a single
+        mis-attribution never outlives the arrival of the real owner.
         """
         key = instance_key(unity_instance)
         with self._lock:
             existing = self.get_active_lease(unity_instance)
             if existing is not None:
                 if existing.owner_key is not None and existing.owner_key == owner_key:
+                    self.touch(unity_instance)
+                elif existing.owner_key is None and owner_key is not None:
+                    self._reattribute_locked(
+                        existing, owner_key, owner_display, project_root
+                    )
                     self.touch(unity_instance)
                 return existing
             now_mono = time.monotonic()
@@ -193,11 +254,36 @@ class PlayLeaseManager:
             )
             self._leases[key] = lease
             self._intents.pop(key, None)
+            if owner_key is not None:
+                # A real MCP cause supersedes a pending force-release override.
+                self._user_suppressed.pop(key, None)
             logger.info(
                 "Play lease acquired for instance %s by '%s'", key, lease.owner_display
             )
             self._write_mirror(lease, active=True)
             return lease
+
+    def _reattribute_locked(
+        self,
+        lease: PlayLease,
+        owner_key: str,
+        owner_display: str,
+        project_root: str | None = None,
+    ) -> None:
+        """Rewrite an inferred-"user" lease's owner in place (caller holds lock)."""
+        previous = lease.owner_display
+        lease.owner_key = owner_key
+        lease.owner_display = owner_display or owner_key
+        if project_root and not lease.project_root:
+            lease.project_root = project_root
+        self._user_suppressed.pop(lease.instance_key, None)
+        logger.info(
+            "Play lease for instance %s re-attributed from '%s' to '%s'",
+            lease.instance_key,
+            previous,
+            lease.owner_display,
+        )
+        self._write_mirror(lease, active=True)
 
     def release(self, unity_instance: str | None, reason: str = "released") -> None:
         key = instance_key(unity_instance)
@@ -213,13 +299,18 @@ class PlayLeaseManager:
 
         Unlike :meth:`get_active_lease`, this inspects the raw lease map so a
         wedged lease whose TTL/grace would otherwise gate its visibility is
-        still cleared. Also discards any pending play intent for the instance.
+        still cleared. Also discards any pending play intent for the instance
+        and suppresses fall-through ``"user"`` re-acquisition until play mode
+        actually exits or a real MCP cause arrives — without that, the next
+        editor-state observation of the still-running play session would
+        immediately re-manufacture the lease the human just cleared.
         Returns True when a lease was present and cleared, False when there was
         nothing to clear. Fails open: never raises.
         """
         key = instance_key(instance_or_hash)
         with self._lock:
             self._intents.pop(key, None)
+            self._user_suppressed[key] = time.monotonic()
             lease = self._leases.get(key)
             if lease is None:
                 return False
@@ -310,10 +401,16 @@ class PlayLeaseManager:
     ) -> None:
         """React to a fresh shared editor-state snapshot.
 
-        Play active with no lease: assign ownership from the pending play
-        intent (an MCP cause) or, absent one, to ``"user"`` (the human
-        pressed Play). Play active with a lease: renew it. Play explicitly
-        ended: clear the lease.
+        Play active with a lease: renew it (bypassing TTL expiry — a snapshot
+        proving play is still running is renewal, so an inactivity lapse can
+        never flip a mid-play lease to "user"); an inferred-"user" lease is
+        re-attributed when a pending intent names the real cause. Play active
+        with no lease and the transition settled: assign ownership from the
+        pending play intent, else the active test job's owner (a PlayMode test
+        run is an MCP cause), else ``"user"`` (the human pressed Play) unless
+        a force-release suppressed the fall-through. A transitional snapshot
+        (``is_changing``) never mints a lease — exit/enter windows carry no
+        new ownership information. Play explicitly ended: clear the lease.
         """
         try:
             if not isinstance(state, dict):
@@ -324,21 +421,47 @@ class PlayLeaseManager:
             key = instance_key(unity_instance)
 
             if is_playing is True:
-                if self.get_active_lease(unity_instance) is not None:
+                lease = self.peek_lease(unity_instance)
+                if lease is not None:
+                    if lease.owner_key is None:
+                        intent = self._take_intent(key)
+                        if intent is not None:
+                            with self._lock:
+                                self._reattribute_locked(
+                                    lease, intent.session_key, intent.display_name
+                                )
                     self.touch(unity_instance)
+                    return
+                if is_changing is True:
+                    # Enter/exit transition window: renewing above is fine,
+                    # but never infer NEW ownership from a transitional
+                    # snapshot (the pending intent is left for the settled
+                    # one).
                     return
                 intent = self._take_intent(key)
                 if intent is not None:
                     owner_key: str | None = intent.session_key
                     owner_display = intent.display_name
                 else:
-                    owner_key = None
-                    owner_display = USER_OWNER_DISPLAY
+                    job_owner = _test_job_owner(unity_instance, state)
+                    if job_owner is not None:
+                        owner_key, owner_display = job_owner
+                    else:
+                        with self._lock:
+                            suppressed = key in self._user_suppressed
+                        if suppressed:
+                            return
+                        owner_key = None
+                        owner_display = USER_OWNER_DISPLAY
                 project_root = await _resolve_project_root(unity_instance)
                 self.acquire(
                     unity_instance, owner_key, owner_display, project_root=project_root
                 )
             elif is_playing is False and is_changing is not True:
+                with self._lock:
+                    # Play has exited: a force-release override has run its
+                    # course; the next play session attributes normally.
+                    self._user_suppressed.pop(key, None)
                 if self.get_active_lease(unity_instance) is not None:
                     self.release(unity_instance, reason="play_exited")
         except Exception as exc:
@@ -427,6 +550,32 @@ async def handle_lease_release_post(request) -> tuple[dict[str, Any], int]:
 # ----------------------------------------------------------------------
 # Helpers shared by the module-level async API
 # ----------------------------------------------------------------------
+def _test_job_owner(
+    unity_instance: str | None,
+    state: dict[str, Any],
+) -> tuple[str, str] | None:
+    """(owner_key, owner_display) of the active test job while tests run.
+
+    A play session observed during a snapshot whose ``tests.is_running`` is
+    true belongs to whoever started the run (a PlayMode test run enters play
+    mode), not to the human — the test-job ownership store carries that
+    session even when the shorter-lived play intent has expired across the
+    run's domain reload. Fails open (None) on any lookup error.
+    """
+    try:
+        tests = state.get("tests") or {}
+        if tests.get("is_running") is not True:
+            return None
+        from services.state.test_job_lease import test_job_lease_manager
+
+        owned = test_job_lease_manager.get_active(unity_instance)
+        if owned is not None and owned.owner_key:
+            return owned.owner_key, owned.owner_display
+    except Exception as exc:
+        logger.debug("play_lease: test-job owner lookup failed (fail-open): %r", exc)
+    return None
+
+
 async def _resolve_project_root(unity_instance: str | None) -> str | None:
     """Project root for the RunState mirror; None fails open (no mirror)."""
     try:

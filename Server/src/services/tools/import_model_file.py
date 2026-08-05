@@ -17,6 +17,7 @@ from transport.legacy.unity_connection import async_send_command_with_retry
 
 
 @mcp_for_unity_tool(
+    compile_risk=True,
     group="asset_gen",
     description=(
         "Import a local 3D model file that already exists on disk (e.g. an FBX/OBJ/glTF "

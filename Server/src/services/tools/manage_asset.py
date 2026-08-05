@@ -17,6 +17,7 @@ from services.tools.preflight import preflight
 
 
 @mcp_for_unity_tool(
+    compile_risk=True,
     description=(
         "Performs asset operations (import, create, modify, delete, etc.) in Unity.\n\n"
         "Tip (payload safety): for `action=\"search\"`, prefer paging (`page_size`, `page_number`) and keep "

@@ -187,6 +187,7 @@ async def verify_edit_by_sha(
         destructiveHint=True,
     ),
     concurrency_class="exclusive",
+    compile_risk=True,
 )
 async def refresh_unity(
     ctx: Context,

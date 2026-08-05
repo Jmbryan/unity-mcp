@@ -669,6 +669,7 @@ def _err(code: str, message: str, *, expected: dict[str, Any] | None = None, rew
     return payload
 
 @mcp_for_unity_tool(
+    compile_risk=True,
     name="script_apply_edits",
     unity_target="manage_script",
     description=(

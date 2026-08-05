@@ -18,6 +18,7 @@ from transport.legacy.unity_connection import async_send_command_with_retry
 
 
 @mcp_for_unity_tool(
+    compile_risk=True,
     group="asset_gen",
     description=(
         "Import 3D models from the Sketchfab marketplace into the Unity project. "

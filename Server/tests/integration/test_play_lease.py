@@ -86,13 +86,17 @@ class FakeEditorState:
 @pytest.fixture(autouse=True)
 def _fresh_lease_state(monkeypatch):
     """Fresh lease/cache/identity state and fast pacing for every test."""
+    from services.state.test_job_lease import test_job_lease_manager
+
     play_lease_manager.reset()
+    test_job_lease_manager.reset()
     editor_state_cache.reset(ttl_s=0.01)
     monkeypatch.setattr(config, "reload_retry_ms", 50, raising=False)
     set_unity_instance_middleware(UnityInstanceMiddleware())
     monkeypatch.setattr(operation_gate, "_registry_last_refresh", 0.0)
     yield
     play_lease_manager.reset()
+    test_job_lease_manager.reset()
     editor_state_cache.reset(ttl_s=0.5)
     set_unity_instance_middleware(UnityInstanceMiddleware())
 
@@ -394,6 +398,41 @@ class TestWrapperPlayAttribution:
         assert lease is not None
         assert lease.owner_key == ctx_a.session_id
         assert lease.owner_display != "user"
+
+    @pytest.mark.asyncio
+    async def test_refused_batch_play_enter_leaves_no_stale_intent(self, monkeypatch):
+        """A gate-refused batch never dispatches, so its speculative intent
+        must not survive to steal a later, unrelated play-enter."""
+        import services.tools.batch_execute as batch_mod
+
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        await _register_instance()
+        editor_state_cache.reset(ttl_s=0.01)
+        _inject_state(monkeypatch, FakeEditorState({
+            "compilation": {"is_compiling": True}, "editor": {}, "tests": {},
+        }))
+
+        ctx_a = await _pinned_context()
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        await middleware.set_active_instance(ctx_a, INSTANCE)
+        monkeypatch.setattr(batch_mod, "_cached_max_commands", 25, raising=False)
+
+        result = await batch_mod.batch_execute(
+            ctx_a,
+            commands=[{"tool": "manage_editor", "params": {"action": "play"}}],
+        )
+
+        assert result["success"] is False
+        assert play_lease_manager._intents == {}
+
+        # A later human play-enter (no MCP cause) resolves to "user".
+        editor_state_cache.reset(ttl_s=0.0)
+        _inject_state(monkeypatch, FakeEditorState(PLAYING_STATE))
+        await editor_state_cache.get(DummyContext(), INSTANCE)
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease is not None
+        assert lease.owner_display == "user"
 
 
 # ----------------------------------------------------------------------
@@ -846,3 +885,267 @@ class TestForceRelease:
 
         assert status == 200
         assert body == {"released": False, "instance": "hash-x"}
+
+
+# ----------------------------------------------------------------------
+# TTL expiry during play never flips the owner (mis-attribution fix 2)
+# ----------------------------------------------------------------------
+EXIT_TRANSITION_STATE = {
+    "compilation": {},
+    "editor": {"play_mode": {"is_playing": True, "is_paused": False, "is_changing": True}},
+    "tests": {},
+}
+TESTS_PLAYING_STATE = {
+    "compilation": {},
+    "editor": {"play_mode": {"is_playing": True, "is_paused": False, "is_changing": False}},
+    "tests": {"is_running": True},
+}
+
+
+class TestTtlExpiryDuringPlay:
+    @pytest.mark.asyncio
+    async def test_expired_lease_renewed_in_place_while_playing(self, monkeypatch):
+        """A snapshot showing play still active renews a TTL-lapsed lease for
+        its owner instead of releasing it and re-acquiring as 'user'."""
+        _inject_state(monkeypatch, FakeEditorState(PLAYING_STATE))
+        ctx_a = await _pinned_context()
+        lease = _acquire_for(ctx_a)
+        stale = time.monotonic() - 9999.0
+        monkeypatch.setattr(lease, "last_activity", stale)
+
+        editor_state_cache.reset(ttl_s=0.0)
+        await editor_state_cache.get(DummyContext(), INSTANCE)
+
+        renewed = play_lease_manager.get_active_lease(INSTANCE)
+        assert renewed is lease
+        assert renewed.owner_key == ctx_a.session_id
+        assert renewed.owner_display == "AgentA"
+        assert renewed.last_activity > stale
+
+    @pytest.mark.asyncio
+    async def test_owner_kept_across_expiry_then_non_owner_still_refused(
+        self, monkeypatch,
+    ):
+        """After the in-place renewal a non-owner's play-scoped call is refused
+        naming the real owner — never 'user'."""
+        await _register_instance()
+        _inject_state(monkeypatch, FakeEditorState(PLAYING_STATE))
+        _fake_probe(monkeypatch, playing=True)
+
+        ctx_a = await _pinned_context()
+        ctx_b = await _pinned_context()
+        lease = _acquire_for(ctx_a)
+        monkeypatch.setattr(lease, "last_activity", time.monotonic() - 9999.0)
+
+        result = await gate_tool_call(ctx_b, "manage_editor", {"action": "stop"})
+
+        assert result is not None
+        assert result["data"]["reason"] == "play_lease"
+        assert result["data"]["blocked_by"] == "AgentA"
+
+    @pytest.mark.asyncio
+    async def test_expired_lease_still_frees_when_not_playing(self, monkeypatch):
+        """Liveness unchanged outside play: an abandoned lease with no play
+        session behind it expires as before."""
+        _inject_state(monkeypatch, FakeEditorState(NOT_PLAYING_STATE))
+        ctx_a = await _pinned_context()
+        lease = _acquire_for(ctx_a)
+        monkeypatch.setattr(lease, "last_activity", time.monotonic() - 9999.0)
+
+        assert play_lease_manager.get_active_lease(INSTANCE) is None
+
+
+# ----------------------------------------------------------------------
+# Correcting an inferred-"user" lease (mis-attribution fix 3)
+# ----------------------------------------------------------------------
+class TestUserLeaseCorrection:
+    @pytest.mark.asyncio
+    async def test_acquire_with_real_owner_corrects_user_lease(self):
+        """A proven MCP cause (successful play call) claims an inferred-'user'
+        lease in place instead of being ignored."""
+        play_lease_manager.acquire(INSTANCE, None, "user")
+
+        lease = play_lease_manager.acquire(INSTANCE, "sess-a", "AgentA")
+
+        assert lease.owner_key == "sess-a"
+        assert lease.owner_display == "AgentA"
+        assert play_lease_manager.get_active_lease(INSTANCE) is lease
+
+    @pytest.mark.asyncio
+    async def test_acquire_never_steals_between_real_owners(self):
+        play_lease_manager.acquire(INSTANCE, "sess-a", "AgentA")
+
+        lease = play_lease_manager.acquire(INSTANCE, "sess-b", "AgentB")
+
+        assert lease.owner_key == "sess-a"
+        assert lease.owner_display == "AgentA"
+
+    @pytest.mark.asyncio
+    async def test_late_intent_reattributes_user_lease_on_observation(self):
+        """A pending intent from a real session corrects an inferred-'user'
+        lease on the next play-active observation."""
+        play_lease_manager.acquire(INSTANCE, None, "user")
+        play_lease_manager.record_play_intent(INSTANCE, "sess-a", "AgentA")
+
+        await play_lease_manager.observe_editor_state(INSTANCE, PLAYING_STATE)
+
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease is not None
+        assert lease.owner_key == "sess-a"
+        assert lease.owner_display == "AgentA"
+
+    @pytest.mark.asyncio
+    async def test_observation_never_reattributes_a_real_owner(self):
+        """A stray intent must not steal a lease that already has a real owner."""
+        play_lease_manager.acquire(INSTANCE, "sess-a", "AgentA")
+        play_lease_manager.record_play_intent(INSTANCE, "sess-b", "AgentB")
+
+        await play_lease_manager.observe_editor_state(INSTANCE, PLAYING_STATE)
+
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease.owner_key == "sess-a"
+
+
+# ----------------------------------------------------------------------
+# Force-release suppression (mis-attribution fix 3, force-release leg)
+# ----------------------------------------------------------------------
+class TestForceReleaseSuppression:
+    @pytest.mark.asyncio
+    async def test_force_release_not_undone_by_next_observation(self):
+        """After a human force-release, the still-running play session must
+        not immediately re-lease to 'user'."""
+        play_lease_manager.acquire(INSTANCE, "sess-a", "AgentA")
+        assert play_lease_manager.force_release("hash-x") is True
+
+        await play_lease_manager.observe_editor_state(INSTANCE, PLAYING_STATE)
+
+        assert play_lease_manager.get_active_lease(INSTANCE) is None
+
+    @pytest.mark.asyncio
+    async def test_suppression_ends_when_play_exits(self):
+        """Play exit closes the override; the NEXT play session attributes
+        normally (a human enter is 'user' again)."""
+        play_lease_manager.acquire(INSTANCE, "sess-a", "AgentA")
+        play_lease_manager.force_release("hash-x")
+
+        await play_lease_manager.observe_editor_state(INSTANCE, NOT_PLAYING_STATE)
+        await play_lease_manager.observe_editor_state(INSTANCE, PLAYING_STATE)
+
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease is not None
+        assert lease.owner_key is None
+        assert lease.owner_display == "user"
+
+    @pytest.mark.asyncio
+    async def test_new_intent_overrides_suppression(self):
+        """A real MCP cause arriving after the force-release attributes the
+        (still running) play session to that session."""
+        play_lease_manager.acquire(INSTANCE, "sess-a", "AgentA")
+        play_lease_manager.force_release("hash-x")
+        play_lease_manager.record_play_intent(INSTANCE, "sess-b", "AgentB")
+
+        await play_lease_manager.observe_editor_state(INSTANCE, PLAYING_STATE)
+
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease is not None
+        assert lease.owner_key == "sess-b"
+
+    @pytest.mark.asyncio
+    async def test_explicit_acquire_overrides_suppression(self):
+        """A successful play call's acquire supersedes the override."""
+        play_lease_manager.acquire(INSTANCE, "sess-a", "AgentA")
+        play_lease_manager.force_release("hash-x")
+
+        lease = play_lease_manager.acquire(INSTANCE, "sess-b", "AgentB")
+        assert lease.owner_key == "sess-b"
+        # The override is spent: later observations renew, not suppress.
+        await play_lease_manager.observe_editor_state(INSTANCE, PLAYING_STATE)
+        assert play_lease_manager.get_active_lease(INSTANCE) is lease
+
+
+# ----------------------------------------------------------------------
+# Transition windows never mint a lease (mis-attribution fix 4)
+# ----------------------------------------------------------------------
+class TestTransitionWindow:
+    @pytest.mark.asyncio
+    async def test_exit_transition_snapshot_does_not_acquire_user_lease(self):
+        """The play-exit window (is_playing still true, is_changing true)
+        right after the owner's stop must not manufacture a 'user' lease."""
+        await play_lease_manager.observe_editor_state(
+            INSTANCE, EXIT_TRANSITION_STATE)
+
+        assert play_lease_manager.get_active_lease(INSTANCE) is None
+
+    @pytest.mark.asyncio
+    async def test_transition_snapshot_preserves_intent_for_settled_one(self):
+        """An intent is not consumed by a transitional snapshot; the settled
+        snapshot that follows attributes to it."""
+        play_lease_manager.record_play_intent(INSTANCE, "sess-a", "AgentA")
+
+        await play_lease_manager.observe_editor_state(
+            INSTANCE, EXIT_TRANSITION_STATE)
+        assert play_lease_manager.get_active_lease(INSTANCE) is None
+
+        await play_lease_manager.observe_editor_state(INSTANCE, PLAYING_STATE)
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease is not None
+        assert lease.owner_key == "sess-a"
+
+    @pytest.mark.asyncio
+    async def test_transition_snapshot_still_renews_existing_lease(self):
+        ctx_a = await _pinned_context()
+        lease = _acquire_for(ctx_a)
+        stale = time.monotonic() - 60.0
+        lease.last_activity = stale
+
+        await play_lease_manager.observe_editor_state(
+            INSTANCE, EXIT_TRANSITION_STATE)
+
+        assert lease.last_activity > stale
+        assert play_lease_manager.get_active_lease(INSTANCE) is lease
+
+
+# ----------------------------------------------------------------------
+# PlayMode test runs attribute to the run's owner (mis-attribution fix 1)
+# ----------------------------------------------------------------------
+class TestPlayModeTestRunAttribution:
+    @pytest.mark.asyncio
+    async def test_play_during_test_run_leases_to_job_owner(self):
+        """With no intent (e.g. expired across the play-enter reload), a play
+        session observed while tests run attributes to the test job's owner."""
+        from services.state.test_job_lease import test_job_lease_manager
+
+        test_job_lease_manager.record(INSTANCE, "job-1", "sess-t", "TestOwner")
+
+        await play_lease_manager.observe_editor_state(
+            INSTANCE, TESTS_PLAYING_STATE)
+
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease is not None
+        assert lease.owner_key == "sess-t"
+        assert lease.owner_display == "TestOwner"
+
+    @pytest.mark.asyncio
+    async def test_unowned_test_run_still_falls_through_to_user(self):
+        """A UI-initiated run (no MCP job ownership) stays a 'user' play
+        session."""
+        await play_lease_manager.observe_editor_state(
+            INSTANCE, TESTS_PLAYING_STATE)
+
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease is not None
+        assert lease.owner_key is None
+        assert lease.owner_display == "user"
+
+    @pytest.mark.asyncio
+    async def test_intent_wins_over_job_owner(self):
+        from services.state.test_job_lease import test_job_lease_manager
+
+        test_job_lease_manager.record(INSTANCE, "job-1", "sess-t", "TestOwner")
+        play_lease_manager.record_play_intent(INSTANCE, "sess-a", "AgentA")
+
+        await play_lease_manager.observe_editor_state(
+            INSTANCE, TESTS_PLAYING_STATE)
+
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease.owner_key == "sess-a"

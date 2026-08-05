@@ -17,6 +17,7 @@ from transport.legacy.unity_connection import async_send_command_with_retry
 
 
 @mcp_for_unity_tool(
+    compile_risk=True,
     group="asset_gen",
     description=(
         "Generate 3D models with AI providers (Tripo, Meshy) and import them "

@@ -410,6 +410,119 @@ class TestPush:
         assert ws.sent[-1]["sessions"] == []
 
 
+class TestExpiryAwareRosterViews:
+    """The roster reads leases/jobs through expiry-aware accessors (pure
+    reads), so expired coordination state neither renders nor gets released
+    out from under the enforcement paths."""
+
+    def test_expired_play_lease_not_rendered(self, monkeypatch):
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        _identity(middleware, "sess-1", label="agent-a")
+        lease = play_lease_manager.acquire(INSTANCE, "sess-1", "AgentA")
+        monkeypatch.setattr(lease, "last_activity", time.monotonic() - 9999.0)
+
+        roster = build_roster()
+
+        assert roster["play_lease"] is None
+        entry = _entry_for(roster, "sess-1")
+        assert entry["state"] != "in-play"
+        assert entry["attribution"]["holds_play_lease"] is False
+        # Pure read: the raw record survives for the renewal/observation path.
+        assert "hash-x" in play_lease_manager._leases
+
+    def test_expired_test_job_not_rendered(self, monkeypatch):
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        _identity(middleware, "sess-1", label="agent-a")
+        job = test_job_lease_manager.record(INSTANCE, "job-1", "sess-1", "AgentA")
+        monkeypatch.setattr(job, "last_activity", time.monotonic() - 99999.0)
+
+        roster = build_roster()
+
+        entry = _entry_for(roster, "sess-1")
+        assert entry["state"] != "running-tests"
+
+    def test_banner_prefers_most_recently_active_lease(self):
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        _identity(middleware, "sess-1", label="agent-a")
+
+        stale = play_lease_manager.acquire("Other@hash-y", None, "user")
+        stale.last_activity = time.monotonic() - 100.0
+        play_lease_manager.acquire(INSTANCE, "sess-1", "AgentA")
+
+        roster = build_roster()
+
+        assert roster["play_lease"]["owner"] == "AgentA"
+        assert roster["play_lease"]["instance"] == HASH
+
+
+class TestEmptyRosterDebounce:
+    def _bridge(self, monkeypatch):
+        ws = _FakeWS()
+        monkeypatch.setattr(PluginHub, "_connections", {"bridge-1": ws})
+        monkeypatch.setattr(PluginHub, "is_configured", classmethod(lambda cls: True))
+        return ws
+
+    @pytest.mark.asyncio
+    async def test_stably_empty_roster_publishes_after_debounce(self, monkeypatch):
+        """'All agents gone' must eventually render — the suppression is a
+        debounce, not a blackout."""
+        ws = self._bridge(monkeypatch)
+        monkeypatch.setenv("UNITY_MCP_ROSTER_HEARTBEAT_S", "9999")
+
+        # First empty build starts the debounce clock and is suppressed.
+        assert await roster_publisher.maybe_push() is False
+        assert ws.sent == []
+
+        # Backdate the clock past the debounce: the next build publishes.
+        roster_publisher._empty_since_mono = (
+            time.monotonic() - (roster_mod.EMPTY_ROSTER_DEBOUNCE_SECONDS + 1.0))
+        assert await roster_publisher.maybe_push() is True
+        assert ws.sent[-1]["sessions"] == []
+        assert ws.sent[-1]["health"]["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_reappearing_session_resets_debounce(self, monkeypatch):
+        ws = self._bridge(monkeypatch)
+        monkeypatch.setenv("UNITY_MCP_ROSTER_HEARTBEAT_S", "9999")
+
+        assert await roster_publisher.maybe_push() is False
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        _identity(middleware, "sess-1", label="agent-a")
+        assert await roster_publisher.maybe_push() is True
+        assert roster_publisher._empty_since_mono is None
+
+    @pytest.mark.asyncio
+    async def test_failed_build_envelope_never_publishes(self, monkeypatch, caplog):
+        """The fail-open empty envelope (health.ok False) is suppressed even
+        past the debounce, and the failure escalates to a throttled warning."""
+        import logging
+
+        ws = self._bridge(monkeypatch)
+        monkeypatch.setenv("UNITY_MCP_ROSTER_HEARTBEAT_S", "9999")
+        monkeypatch.setattr(roster_mod, "_build_fail_last_warn", 0.0)
+
+        def _boom():
+            raise RuntimeError("store exploded")
+
+        monkeypatch.setattr(roster_mod, "_build_roster_inner", _boom)
+
+        with caplog.at_level(
+            logging.WARNING, logger="services.state.session_roster",
+        ):
+            assert await roster_publisher.maybe_push() is False
+            roster_publisher._empty_since_mono = (
+                time.monotonic() - (roster_mod.EMPTY_ROSTER_DEBOUNCE_SECONDS + 1.0))
+            assert await roster_publisher.maybe_push() is False
+
+        assert ws.sent == []
+        assert any(
+            "roster build failing" in rec.getMessage() for rec in caplog.records)
+
+
 class TestRegisterPush:
     @pytest.mark.asyncio
     async def test_register_force_pushes_roster_to_new_bridge(self, monkeypatch):

@@ -14,6 +14,7 @@ from transport.legacy.unity_connection import async_send_command_with_retry
 
 
 @mcp_for_unity_tool(
+    compile_risk=True,
     description="Execute a Unity menu item by path.",
     annotations=ToolAnnotations(
         title="Execute Menu Item",

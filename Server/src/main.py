@@ -388,6 +388,54 @@ def _normalize_instance_token(instance_token: str | None) -> tuple[str | None, s
     return None, instance_token
 
 
+def _is_loopback_host(value: str | None) -> bool:
+    host = (value or "").strip().lower()
+    return host in ("localhost", "127.0.0.1", "::1", "[::1]")
+
+
+async def _authorize_state_route(request: Request) -> JSONResponse | None:
+    """Shared auth guard for the /agent-status and /lease/release routes.
+
+    Remote-hosted mode: the same credential as every other HTTP surface — a
+    valid ``X-API-Key`` header, fail closed (401 missing, 403 invalid, 503
+    when the auth service is unavailable). Local mode has no credential
+    mechanism, so the routes stay open only while the server is bound to
+    loopback; with a non-loopback bind, only loopback peers are accepted.
+    Returns ``None`` when the request may proceed.
+    """
+    from core.constants import API_KEY_HEADER
+
+    if config.http_remote_hosted:
+        if not ApiKeyService.is_initialized():
+            return JSONResponse(
+                {"success": False, "error": "auth_unavailable"}, status_code=503
+            )
+        api_key = request.headers.get(API_KEY_HEADER)
+        if not api_key:
+            return JSONResponse(
+                {"success": False, "error": "auth_required"}, status_code=401
+            )
+        try:
+            result = await ApiKeyService.get_instance().validate(api_key)
+        except Exception:
+            return JSONResponse(
+                {"success": False, "error": "auth_unavailable"}, status_code=503
+            )
+        if not result.valid or not result.user_id:
+            return JSONResponse(
+                {"success": False, "error": "invalid_api_key"}, status_code=403
+            )
+        return None
+
+    bind_host = os.environ.get("UNITY_MCP_HTTP_HOST", "localhost")
+    if _is_loopback_host(bind_host):
+        return None
+    client = getattr(request, "client", None)
+    if _is_loopback_host(getattr(client, "host", None)):
+        return None
+    return JSONResponse({"success": False, "error": "forbidden"}, status_code=403)
+
+
 def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
     mcp = FastMCP(
         name="mcp-for-unity-server",
@@ -417,7 +465,12 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
         ignored by the hook. Malformed or missing fields are tolerated and
         never produce a 500 — a slow or erroring route must never block an
         agent. A meaningful ingest opportunistically nudges a roster push.
+        Requires the same credentials as tool calls in remote-hosted mode.
         """
+        denied = await _authorize_state_route(request)
+        if denied is not None:
+            return denied
+
         from services.state.agent_status_store import handle_agent_status_post
 
         body, status_code = await handle_agent_status_post(request)
@@ -432,7 +485,12 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
         regardless of owner, updating the RunState mirror to inactive. Always
         responds 200 with ``{"released": bool, "instance": ...}``; a missing
         body clears nothing and any internal error fails open — never a 500.
+        Requires the same credentials as tool calls in remote-hosted mode.
         """
+        denied = await _authorize_state_route(request)
+        if denied is not None:
+            return denied
+
         from services.state.play_lease import handle_lease_release_post
 
         body, status_code = await handle_lease_release_post(request)

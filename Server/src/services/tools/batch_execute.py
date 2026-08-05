@@ -13,9 +13,13 @@ from services.state.operation_gate import (
     escalate_class,
     gate_for_class,
     record_exclusive_edge_after_arbitrary_code,
+    resolve_compile_risk,
     resolve_tool_class,
 )
-from services.state.play_lease import record_play_intent_for_session
+from services.state.play_lease import (
+    clear_play_intent_for_session,
+    record_play_intent_for_session,
+)
 from services.tools import get_unity_instance_from_context
 from transport.unity_transport import send_with_unity_instance
 from transport.legacy.unity_connection import async_send_command_with_retry
@@ -151,12 +155,17 @@ async def batch_execute(
     # at the max-severity class (a batch of reads stays a read).
     user_id = await get_unity_instance_from_context(ctx, "user_id")
     effective_class = CLASS_READ
+    effective_compile_risk = False
     has_play_enter = False
     for command in normalized_commands:
         inner_class = await resolve_tool_class(
             command["tool"], command["params"], unity_instance, user_id
         )
         effective_class = escalate_class(effective_class, inner_class)
+        if not effective_compile_risk:
+            effective_compile_risk = await resolve_compile_risk(
+                command["tool"], command["params"], unity_instance, user_id
+            )
         if _is_play_enter(command):
             has_play_enter = True
 
@@ -169,8 +178,15 @@ async def batch_execute(
     if has_play_enter:
         await record_play_intent_for_session(ctx, unity_instance)
 
-    busy = await gate_for_class(ctx, effective_class, "batch_execute", unity_instance)
+    busy = await gate_for_class(
+        ctx, effective_class, "batch_execute", unity_instance,
+        compile_risk=effective_compile_risk,
+    )
     if busy is not None:
+        # The refused batch never dispatches: drop the speculative intent so
+        # it cannot misattribute whatever play transition happens next.
+        if has_play_enter:
+            await clear_play_intent_for_session(ctx, unity_instance)
         return busy
 
     payload: dict[str, Any] = {
