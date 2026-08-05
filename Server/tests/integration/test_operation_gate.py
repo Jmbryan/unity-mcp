@@ -25,6 +25,7 @@ import time
 import types
 
 import pytest
+from fastmcp.exceptions import ToolError
 
 from core.config import config
 from models.models import MCPResponse, ToolDefinitionModel
@@ -902,7 +903,7 @@ class _MiddlewareContext:
 
 class TestMiddlewareGate:
     @pytest.mark.asyncio
-    async def test_busy_call_returns_tool_result_without_calling_next(self, monkeypatch):
+    async def test_busy_call_raises_tool_error_without_calling_next(self, monkeypatch):
         monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
         _inject_state(monkeypatch, FakeEditorState(COMPILING_STATE))
 
@@ -918,13 +919,41 @@ class TestMiddlewareGate:
             called["next"] = True
             return "tool-ran"
 
-        result = await middleware.on_call_tool(context, call_next)
+        with pytest.raises(ToolError) as excinfo:
+            await middleware.on_call_tool(context, call_next)
 
         assert "next" not in called
-        payload = result.structured_content
-        assert payload["success"] is False
-        assert payload["hint"] == "retry"
-        assert payload["data"]["reason"] == "compiling"
+        message = str(excinfo.value)
+        assert "manage_gameobject" in message
+        assert "reason=compiling" in message
+        assert "retry_after_ms=1000" in message
+
+    @pytest.mark.asyncio
+    async def test_busy_call_never_returns_an_unwrapped_envelope(self, monkeypatch):
+        """A returned envelope skips Tool.convert_result.
+
+        Tools whose output schema carries ``x-fastmcp-wrap-result`` (any
+        non-object return annotation, e.g. ``run_tests``) then fail SDK output
+        validation with "'result' is a required property", because the busy
+        payload was never wrapped in ``{"result": ...}``. Raising is the only
+        short-circuit that is correct for every tool's schema.
+        """
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        _inject_state(monkeypatch, FakeEditorState(TESTING_STATE))
+
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        ctx = GateContext()
+        await middleware.set_active_instance(ctx, "ProjectA@hash-a")
+        context = _MiddlewareContext(ctx, "run_tests", {"mode": "EditMode"})
+
+        async def call_next(_context):
+            raise AssertionError("gated call must not dispatch")
+
+        with pytest.raises(ToolError) as excinfo:
+            await middleware.on_call_tool(context, call_next)
+
+        assert "reason=running_tests" in str(excinfo.value)
 
     @pytest.mark.asyncio
     async def test_read_call_passes_straight_through(self, monkeypatch):

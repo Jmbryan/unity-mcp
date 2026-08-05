@@ -84,9 +84,19 @@ class _DummyToolResult:
         self.meta = meta
 
 
+class _DummyToolError(Exception):
+    """Stub for fastmcp.exceptions.ToolError (client-visible tool failure)."""
+
+
 fastmcp.FastMCP = _DummyFastMCP
 fastmcp.Context = _DummyContext
 sys.modules.setdefault("fastmcp", fastmcp)
+
+# Stub fastmcp.exceptions (the middleware raises ToolError on a busy verdict)
+fastmcp_exceptions = types.ModuleType("fastmcp.exceptions")
+fastmcp_exceptions.ToolError = _DummyToolError
+fastmcp.exceptions = fastmcp_exceptions
+sys.modules.setdefault("fastmcp.exceptions", fastmcp_exceptions)
 
 # Stub fastmcp.server, fastmcp.server.middleware, fastmcp.server.server submodules
 fastmcp_server = types.ModuleType("fastmcp.server")

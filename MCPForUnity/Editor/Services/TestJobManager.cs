@@ -99,6 +99,14 @@ namespace MCPForUnity.Editor.Services
             {
                 if (string.IsNullOrEmpty(_currentJobId))
                 {
+                    // No tracked job, but the run flag can still be wedged from an
+                    // earlier clear that dropped the id without it. clear_stuck is the
+                    // only manual lever, so reconcile here too.
+                    if (TestRunStatus.IsRunning)
+                    {
+                        McpLog.Warn("[TestJobManager] No tracked test job, but the test-run flag was still set; clearing it");
+                        TestRunStatus.MarkFinished();
+                    }
                     return false;
                 }
 
@@ -114,6 +122,10 @@ namespace MCPForUnity.Editor.Services
                 }
 
                 _currentJobId = null;
+                // Clearing the job id without clearing the run flag wedges the editor:
+                // TestRunStatus.IsRunning stays true forever, and every exclusive-class
+                // MCP call (run_tests included) then parks behind a phantom test run.
+                TestRunStatus.MarkFinished();
             }
             PersistToSessionState(force: true);
             return cleared;
@@ -512,9 +524,14 @@ namespace MCPForUnity.Editor.Services
                         if (_currentJobId == jobId)
                         {
                             _currentJobId = null;
-                            // Keep TestRunStatus in sync: when initialization times out, neither
-                            // RunStarted nor RunFinished fires, so the running flag would otherwise leak.
-                            // Only clear it if this job is still the active one — a newer job may have taken over.
+                        }
+                        // Keep TestRunStatus in sync: when initialization times out, neither
+                        // RunStarted nor RunFinished fires, so the running flag would otherwise
+                        // leak. Clear it whenever no job is active afterwards — that covers both
+                        // "this job was the active one" and "the id was already dropped without
+                        // clearing the flag". A newer job holding _currentJobId keeps the flag.
+                        if (string.IsNullOrEmpty(_currentJobId))
+                        {
                             TestRunStatus.MarkFinished();
                         }
                         shouldPersist = true;

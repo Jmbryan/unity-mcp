@@ -723,18 +723,31 @@ class UnityInstanceMiddleware(Middleware):
         correctly even when the play-enter domain reload eats the result),
         and observed play/pause/stop outcomes acquire, renew, or release the
         lease implicitly.
+
+        A busy verdict is raised as a ToolError rather than returned. A
+        short-circuited call never reaches ``Tool.convert_result``, so a
+        returned envelope skips the ``x-fastmcp-wrap-result`` ``{"result": ...}``
+        wrap that tools with a non-object output schema declare (``run_tests``,
+        ``get_test_job``, ``refresh_unity``), and the SDK rejects the call with
+        "Output validation error: 'result' is a required property". Raising
+        bypasses output validation for every tool regardless of its schema.
         """
         await self._inject_unity_instance(context)
         busy = await self._gate_tool_call(context)
         if busy is not None:
-            import json
+            from fastmcp.exceptions import ToolError
 
-            from fastmcp.server.server import ToolResult
-
-            return ToolResult(
-                content=json.dumps(busy),
-                structured_content=busy,
-            )
+            message = busy.get("error") or "Editor is busy; retry shortly."
+            data = busy.get("data")
+            if isinstance(data, dict):
+                detail = ", ".join(
+                    f"{key}={data[key]}"
+                    for key in ("reason", "blocked_by", "retry_after_ms")
+                    if data.get(key) is not None
+                )
+                if detail:
+                    message = f"{message} ({detail})"
+            raise ToolError(message)
         tool_name, arguments = self._tool_call_shape(context)
         session_key: str | None = None
         if tool_name is not None:
