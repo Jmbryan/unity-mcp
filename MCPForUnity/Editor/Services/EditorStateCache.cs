@@ -273,6 +273,12 @@ namespace MCPForUnity.Editor.Services
                 CompilationPipeline.compilationStarted += _ => EmitEditorEdgeEvent("compile_started");
                 CompilationPipeline.compilationFinished += _ => EmitEditorEdgeEvent("compile_finished");
 
+                // Tracks whether an assembly compilation is actually running, for
+                // GetActualIsCompiling. Statics reset on domain reload and this
+                // [InitializeOnLoad] ctor re-subscribes, so the flag is per-domain.
+                UnityEditor.Compilation.CompilationPipeline.compilationStarted += _ => _pipelineCompilationRunning = true;
+                UnityEditor.Compilation.CompilationPipeline.compilationFinished += _ => _pipelineCompilationRunning = false;
+
                 AssemblyReloadEvents.beforeAssemblyReload += () =>
                 {
                     _domainReloadPending = true;
@@ -297,7 +303,7 @@ namespace MCPForUnity.Editor.Services
         {
             // Throttle to reduce overhead while keeping the snapshot fresh enough for polling clients.
             double now = EditorApplication.timeSinceStartup;
-            // Use GetActualIsCompiling() to avoid Play mode false positives (issue #582)
+            // Use GetActualIsCompiling() to avoid isCompiling false positives (issues #549, #1276)
             bool isCompiling = GetActualIsCompiling();
 
             // Check for compilation edge transitions (always update on these)
@@ -606,6 +612,13 @@ namespace MCPForUnity.Editor.Services
             }
         }
 
+        // Set/cleared by the CompilationPipeline.compilationStarted/Finished events
+        // subscribed in the static ctor. NOTE: CompilationPipeline.isCompiling does not
+        // exist on the supported Unity range (verified by reflection probe on 2021.3 and
+        // 6000.4 — neither public nor non-public), so the reflection this replaced never
+        // resolved and always fell back to the raw signal.
+        private static bool _pipelineCompilationRunning;
+
         /// <summary>
         /// Determines whether the editor is mid play-mode transition purely from the two
         /// EditorApplication facts, with no dependence on playModeStateChanged event continuity.
@@ -625,11 +638,14 @@ namespace MCPForUnity.Editor.Services
         }
 
         /// <summary>
-        /// Returns the actual compilation state, working around a known Unity quirk where
-        /// EditorApplication.isCompiling can return false positives in Play mode.
-        /// See: https://github.com/CoplayDev/unity-mcp/issues/549
+        /// Returns the actual compilation state, working around known Unity quirks where
+        /// EditorApplication.isCompiling reports false positives while no compilation is
+        /// running: a recompile deferred by Recompile-After-Finished-Playing keeps it true
+        /// for the whole play session (issue #549), and a project holding
+        /// EditorApplication.LockReloadAssemblies keeps it true until the lock is released
+        /// (issue #1276). In both cases the event-tracked pipeline flag is authoritative.
         /// </summary>
-        private static bool GetActualIsCompiling()
+        internal static bool GetActualIsCompiling()
         {
             // If EditorApplication.isCompiling is false, Unity is definitely not compiling
             if (!EditorApplication.isCompiling)
@@ -637,27 +653,9 @@ namespace MCPForUnity.Editor.Services
                 return false;
             }
 
-            // In Play mode, EditorApplication.isCompiling can have false positives.
-            // Double-check with CompilationPipeline.isCompiling via reflection.
-            if (EditorApplication.isPlaying)
-            {
-                try
-                {
-                    Type pipeline = Type.GetType("UnityEditor.Compilation.CompilationPipeline, UnityEditor");
-                    var prop = pipeline?.GetProperty("isCompiling", BindingFlags.Public | BindingFlags.Static);
-                    if (prop != null)
-                    {
-                        return (bool)prop.GetValue(null);
-                    }
-                }
-                catch
-                {
-                    // If reflection fails, fall back to EditorApplication.isCompiling
-                }
-            }
-
-            // Outside Play mode or if reflection failed, trust EditorApplication.isCompiling
-            return true;
+            // Otherwise trust the event-tracked pipeline state: isCompiling stays true for as
+            // long as an assembly reload is deferred, with no compilation actually running.
+            return _pipelineCompilationRunning;
         }
     }
 }

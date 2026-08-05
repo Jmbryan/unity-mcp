@@ -198,7 +198,10 @@ async def run_tests(
     # Abort/clear surface (MCPC-022): clearing the editor's running job is the
     # only call that cancels another session's test run. It is owner-only — a
     # non-owner receives a structured busy result naming the owner; an unknown
-    # or expired job fails open.
+    # or expired job fails open. Runs before both the init_timeout check and
+    # preflight on purpose: neither is relevant to clearing, and
+    # requires_no_tests would reject the very call that exists to clear the
+    # orphaned job blocking it.
     if clear_stuck:
         from services.state.test_job_lease import (
             enforce_clear_ownership,
@@ -280,6 +283,9 @@ async def run_tests(
     annotations=ToolAnnotations(
         title="Get Test Job",
         readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
     ),
     concurrency_class="read",
 )
