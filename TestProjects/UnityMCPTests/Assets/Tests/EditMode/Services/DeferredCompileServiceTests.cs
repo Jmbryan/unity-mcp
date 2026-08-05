@@ -28,6 +28,8 @@ namespace MCPForUnityTests.Editor.Services
         private const string SessionKey_PendingReason = "MCPForUnity.DeferredCompile.Reason";
         private const string SessionKey_PendingImports = "MCPForUnity.DeferredCompile.PendingImports";
         private const string SessionKey_AutoRefreshDepth = "MCPForUnity.DeferredCompile.AutoRefreshDepth";
+        private const string SessionKey_PendingRefresh = "MCPForUnity.DeferredCompile.PendingRefresh";
+        private const string SessionKey_PendingRefreshOptions = "MCPForUnity.DeferredCompile.PendingRefreshOptions";
 
         private Type _svc;
         private MethodInfo _setPending;
@@ -43,6 +45,8 @@ namespace MCPForUnityTests.Editor.Services
         private string _origReason;
         private string _origImports;
         private int _origDepth;
+        private bool _origPendingRefresh;
+        private int _origPendingRefreshOptions;
 
         // True when this fixture marked the test-run-active flag itself (headless launch path) and
         // must clear it in TearDown. When the run is already flagged (in-editor MCP launch) we leave
@@ -76,6 +80,8 @@ namespace MCPForUnityTests.Editor.Services
             _origReason = SessionState.GetString(SessionKey_PendingReason, string.Empty);
             _origImports = SessionState.GetString(SessionKey_PendingImports, string.Empty);
             _origDepth = SessionState.GetInt(SessionKey_AutoRefreshDepth, 0);
+            _origPendingRefresh = SessionState.GetBool(SessionKey_PendingRefresh, false);
+            _origPendingRefreshOptions = SessionState.GetInt(SessionKey_PendingRefreshOptions, 0);
 
             // Establish the blocking span deterministically (see class summary). Only mark it ourselves
             // if it is not already active, so the in-editor MCP launch path is left untouched.
@@ -88,6 +94,8 @@ namespace MCPForUnityTests.Editor.Services
             // Start each test from a clean defer state.
             SetPending(false, null);
             _setDepth.Invoke(null, new object[] { 0 });
+            SessionState.SetBool(SessionKey_PendingRefresh, false);
+            SessionState.EraseInt(SessionKey_PendingRefreshOptions);
         }
 
         [TearDown]
@@ -106,6 +114,8 @@ namespace MCPForUnityTests.Editor.Services
             SessionState.SetString(SessionKey_PendingReason, _origReason);
             SessionState.SetString(SessionKey_PendingImports, _origImports);
             SessionState.SetInt(SessionKey_AutoRefreshDepth, _origDepth);
+            SessionState.SetBool(SessionKey_PendingRefresh, _origPendingRefresh);
+            SessionState.SetInt(SessionKey_PendingRefreshOptions, _origPendingRefreshOptions);
             _suppressedThisLoad.SetValue(null, false);
 
             if (_markedTestRun)
@@ -226,6 +236,48 @@ namespace MCPForUnityTests.Editor.Services
 
             Assert.IsTrue(DeferredCompileService.HasPendingCompile,
                 "Flush must not fire while play/test is still active; the request stays pending.");
+        }
+
+        // ---- Explicit-refresh funnel (defense against DisallowAutoRefresh bypass) ----------------
+
+        [Test]
+        public void RequestRefresh_WhileDeferActive_DefersAndRecordsPending()
+        {
+            bool deferred = DeferredCompileService.RequestRefresh(
+                "unit_test_refresh", ImportAssetOptions.ForceSynchronousImport);
+
+            Assert.IsTrue(deferred,
+                "An explicit refresh must be held while a test run is active — DisallowAutoRefresh "
+                + "does not suppress explicit AssetDatabase.Refresh calls, so letting it through "
+                + "would import every held-back script write.");
+            Assert.IsTrue(DeferredCompileService.HasPendingRefresh,
+                "The held refresh must be recorded so it flushes on return to idle.");
+            Assert.IsTrue(SessionState.GetBool(SessionKey_PendingRefresh, false),
+                "Pending refresh must persist to SessionState (survives domain reload).");
+        }
+
+        [Test]
+        public void RequestRefresh_OptionsAccumulateAcrossDeferredRequests()
+        {
+            DeferredCompileService.RequestRefresh("first", ImportAssetOptions.ForceSynchronousImport);
+            DeferredCompileService.RequestRefresh("second", ImportAssetOptions.ForceUpdate);
+
+            int combined = SessionState.GetInt(SessionKey_PendingRefreshOptions, 0);
+            Assert.AreEqual(
+                (int)(ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate),
+                combined,
+                "Deferred refresh options must OR-combine so the single replay honors every request.");
+        }
+
+        [Test]
+        public void FlushIfPending_WhileStillDeferActive_KeepsPendingRefresh()
+        {
+            DeferredCompileService.RequestRefresh("still_blocked", ImportAssetOptions.ForceSynchronousImport);
+
+            _flushIfPending.Invoke(null, new object[] { "unit_test" });
+
+            Assert.IsTrue(DeferredCompileService.HasPendingRefresh,
+                "Flush must not replay a held refresh while the play/test span is still active.");
         }
 
         // ---- MCPC-021: refcounted auto-refresh suppression + reload rebalance --------------------

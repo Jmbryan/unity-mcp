@@ -278,7 +278,10 @@ namespace MCPForUnity.Editor.Tools.Prefabs
             if (result != null)
             {
                 AssetDatabase.SaveAssets();
-                AssetDatabase.Refresh();
+                // Funnelled: an explicit full refresh is not suppressed by DisallowAutoRefresh and
+                // would import held-back script writes mid play/test span. The prefab itself is
+                // already saved and registered by SaveAssets.
+                Services.DeferredCompileService.RequestRefresh("manage_prefabs_save");
             }
 
             return result;
@@ -448,7 +451,8 @@ namespace MCPForUnity.Editor.Tools.Prefabs
             if (!Directory.Exists(fullDirectory))
             {
                 Directory.CreateDirectory(fullDirectory);
-                AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
+                // Compile-safe folder registration; see DeferredCompileService.ImportFolderNow.
+                Services.DeferredCompileService.ImportFolderNow(directory);
                 McpLog.Info($"[ManagePrefabs] Created directory: {directory}");
             }
         }
@@ -659,7 +663,8 @@ namespace MCPForUnity.Editor.Tools.Prefabs
                     return new ErrorResponse($"Failed to save prefab asset at '{sanitizedPath}'.");
                 }
 
-                AssetDatabase.Refresh();
+                // Funnelled; see the save-path comment near the top of this file.
+                Services.DeferredCompileService.RequestRefresh("manage_prefabs_modify");
 
                 McpLog.Info($"[ManagePrefabs] Successfully modified and saved prefab '{sanitizedPath}' (headless).");
 
@@ -1410,7 +1415,8 @@ namespace MCPForUnity.Editor.Tools.Prefabs
 
             prefabStage.ClearDirtiness();
             AssetDatabase.SaveAssets();
-            AssetDatabase.Refresh();
+            // Funnelled; see the save-path comment near the top of this file.
+            Services.DeferredCompileService.RequestRefresh("manage_prefabs_stage_save");
             return true;
         }
 

@@ -23,6 +23,10 @@ namespace MCPForUnity.Editor.Services
     /// held too: pending paths accumulate in <see cref="SessionState"/> and are imported together with
     /// the compile request on flush. Deferring only the <see cref="CompilationPipeline.RequestScriptCompilation()"/>
     /// edge while still importing would leak a compile into play mode / a test run.
+    ///
+    /// Explicit full refreshes are funnelled the same way (<see cref="RequestRefresh"/>): an
+    /// <see cref="AssetDatabase.Refresh(ImportAssetOptions)"/> call is not suppressed by
+    /// DisallowAutoRefresh and would import every held-back script write mid-span.
     /// </summary>
     [InitializeOnLoad]
     internal static class DeferredCompileService
@@ -38,6 +42,21 @@ namespace MCPForUnity.Editor.Services
 
         // Auto-refresh suppression depth (MCPC-021). Refcounted so nested play/test spans balance.
         private const string SessionKey_AutoRefreshDepth = "MCPForUnity.DeferredCompile.AutoRefreshDepth";
+
+        // Pending full asset-database refresh held while deferring. AssetDatabase.DisallowAutoRefresh
+        // only suppresses Unity's AUTOMATIC refresh — an explicit AssetDatabase.Refresh() call still
+        // scans the whole project and imports every changed script on disk, including writes whose
+        // import this service is deliberately holding. Explicit refresh requests are therefore held
+        // for the span too and replayed on flush. Persisted so a domain reload mid-defer keeps them.
+        private const string SessionKey_PendingRefresh = "MCPForUnity.DeferredCompile.PendingRefresh";
+        private const string SessionKey_PendingRefreshOptions = "MCPForUnity.DeferredCompile.PendingRefreshOptions";
+
+        /// <summary>
+        /// Grace window during which an uncorroborated test-run flag still holds the defer span.
+        /// Covers snapshot/callback ordering gaps around run start and teardown; long past it, a
+        /// run flag with no live job is treated as wedged rather than as evidence of a run.
+        /// </summary>
+        private const long UncorroboratedRunFlagGraceMs = 60_000;
 
         private static TestRunnerApi _api;
         private static bool _autoRefreshSuppressedThisLoad;
@@ -74,7 +93,31 @@ namespace MCPForUnity.Editor.Services
         internal static bool IsDeferActive =>
             EditorApplication.isPlayingOrWillChangePlaymode
             || EditorApplication.isPlaying
-            || TestRunStatus.IsRunning;
+            || IsTestRunHolding;
+
+        /// <summary>
+        /// True while the test-run flag should hold the defer span. The raw
+        /// <see cref="TestRunStatus.IsRunning"/> flag alone is not enough: it is a plain static that
+        /// recovery paths can leave wedged true, and a wedged flag would hold every bridge-routed
+        /// compile for the rest of the editor session (the held compile is the only thing that could
+        /// reset the statics, so the wedge is self-sealing). The flag holds when corroborated by a
+        /// live <see cref="TestJobManager"/> job — a 30+ minute soak run stays corroborated for its
+        /// whole duration — or while it is fresh enough that job bookkeeping may legitimately lag.
+        /// A stale, uncorroborated flag stops holding compiles.
+        /// </summary>
+        private static bool IsTestRunHolding
+        {
+            get
+            {
+                if (!TestRunStatus.IsRunning) return false;
+                if (TestJobManager.HasRunningJob) return true;
+
+                long started = TestRunStatus.StartedUnixMs ?? 0;
+                if (started <= 0) return false;
+                long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                return now - started <= UncorroboratedRunFlagGraceMs;
+            }
+        }
 
         /// <summary>Whether a compile request is currently held pending return to idle (MCPC-020).</summary>
         internal static bool HasPendingCompile => SessionState.GetBool(SessionKey_PendingCompile, false);
@@ -151,6 +194,76 @@ namespace MCPForUnity.Editor.Services
             var opts = ImportAssetOptions.ForceUpdate;
             if (synchronous) opts |= ImportAssetOptions.ForceSynchronousImport;
             AssetDatabase.ImportAsset(assetsRelativePath, opts);
+        }
+
+        /// <summary>Whether a full asset-database refresh is currently held pending return to idle.</summary>
+        internal static bool HasPendingRefresh => SessionState.GetBool(SessionKey_PendingRefresh, false);
+
+        /// <summary>
+        /// Request a full <see cref="AssetDatabase.Refresh(ImportAssetOptions)"/> through the defer
+        /// funnel. Fires immediately when idle; while play mode or a test run is active the refresh
+        /// is held and replayed on return to idle, because an explicit Refresh scans the project and
+        /// imports every changed script on disk — precisely the writes whose import this service is
+        /// holding (<see cref="AssetDatabase.DisallowAutoRefresh"/> does not suppress explicit calls).
+        /// Options from multiple deferred requests are OR-combined for the single replay.
+        /// Returns true if the refresh was deferred, false if it fired immediately.
+        /// </summary>
+        internal static bool RequestRefresh(string reason, ImportAssetOptions options = ImportAssetOptions.ForceSynchronousImport)
+        {
+            if (IsDeferActive)
+            {
+                int combined = SessionState.GetInt(SessionKey_PendingRefreshOptions, 0) | (int)options;
+                SessionState.SetBool(SessionKey_PendingRefresh, true);
+                SessionState.SetInt(SessionKey_PendingRefreshOptions, combined);
+                McpLog.Info($"[DeferredCompileService] Asset refresh deferred ({reason}); will flush on return to idle.", always: false);
+                return true;
+            }
+
+            AssetDatabase.Refresh(options);
+            return false;
+        }
+
+        private static void ClearPendingRefresh()
+        {
+            SessionState.SetBool(SessionKey_PendingRefresh, false);
+            SessionState.EraseInt(SessionKey_PendingRefreshOptions);
+        }
+
+        /// <summary>
+        /// Register a just-created folder (and any unregistered ancestors) with the asset database so
+        /// follow-up operations (CreateAsset, SaveAsPrefabAsset, ...) can address paths inside it.
+        /// This is the defer-safe replacement for the full <see cref="AssetDatabase.Refresh()"/> call
+        /// these sites historically used: a targeted folder import is not a compile trigger, whereas a
+        /// full refresh scans the whole project and imports held-back script writes mid-span.
+        /// Accepts either an Assets-relative or a backslashed path; no-ops on null/empty.
+        /// </summary>
+        internal static void ImportFolderNow(string folderPath)
+        {
+            if (string.IsNullOrEmpty(folderPath)) return;
+
+            string normalized = folderPath.Replace('\\', '/').Trim().TrimEnd('/');
+            if (string.IsNullOrEmpty(normalized)) return;
+
+            try
+            {
+                // Import unregistered ancestors top-down: a multi-level Directory.CreateDirectory
+                // chain leaves every new level unknown to the database, and importing only the leaf
+                // does not register unknown parents.
+                string[] segments = normalized.Split('/');
+                string current = segments[0];
+                for (int i = 1; i < segments.Length; i++)
+                {
+                    current = current + "/" + segments[i];
+                    if (string.IsNullOrEmpty(AssetDatabase.AssetPathToGUID(current)))
+                    {
+                        AssetDatabase.ImportAsset(current, ImportAssetOptions.ForceSynchronousImport);
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                McpLog.Warn($"[DeferredCompileService] Folder import failed for '{normalized}': {e.Message}");
+            }
         }
 
         #region Auto-refresh suppression (MCPC-021)
@@ -262,13 +375,19 @@ namespace MCPForUnity.Editor.Services
 
         private static void FlushIfPending(string trigger)
         {
-            if (!HasPendingCompile) return;
             if (IsDeferActive) return; // Still blocked; flush will be retried on the next end edge.
+
+            bool hasCompile = HasPendingCompile;
+            bool hasRefresh = HasPendingRefresh;
+            if (!hasCompile && !hasRefresh) return;
 
             // Import any script edits whose import we held (importing a script is the compile trigger),
             // then issue an explicit compile request to cover non-import-backed pending compiles.
             var pendingImports = SessionState.GetString(SessionKey_PendingImports, string.Empty);
+            var refreshOptions = (ImportAssetOptions)SessionState.GetInt(
+                SessionKey_PendingRefreshOptions, (int)ImportAssetOptions.ForceSynchronousImport);
             SetPending(false, null);
+            ClearPendingRefresh();
 
             if (!string.IsNullOrEmpty(pendingImports))
             {
@@ -280,16 +399,26 @@ namespace MCPForUnity.Editor.Services
                 }
             }
 
-            McpLog.Info($"[DeferredCompileService] Flushing deferred compile ({trigger}).");
-            CompilationPipeline.RequestScriptCompilation();
+            if (hasRefresh)
+            {
+                McpLog.Info($"[DeferredCompileService] Flushing deferred asset refresh ({trigger}).");
+                try { AssetDatabase.Refresh(refreshOptions); }
+                catch (Exception e) { McpLog.Warn($"[DeferredCompileService] Flush refresh failed: {e.Message}"); }
+            }
+
+            if (hasCompile)
+            {
+                McpLog.Info($"[DeferredCompileService] Flushing deferred compile ({trigger}).");
+                CompilationPipeline.RequestScriptCompilation();
+            }
         }
 
         #endregion
 
         /// <summary>
         /// Public flush entrypoint for service callers (e.g. <see cref="SessionRosterService"/>).
-        /// Flushes a held compile when the editor is idle; a no-op when nothing is pending or a
-        /// play/test span is still active. Must run on the main thread.
+        /// Flushes a held compile and/or refresh when the editor is idle; a no-op when nothing is
+        /// pending or a play/test span is still active. Must run on the main thread.
         /// </summary>
         internal static void FlushNow(string trigger)
         {

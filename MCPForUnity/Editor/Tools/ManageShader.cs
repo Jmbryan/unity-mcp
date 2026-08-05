@@ -98,8 +98,10 @@ namespace MCPForUnity.Editor.Tools
                     if (!Directory.Exists(fullPathDir))
                     {
                         Directory.CreateDirectory(fullPathDir);
-                        // Refresh AssetDatabase to recognize new folders
-                        AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
+                        // Targeted folder import instead of a full refresh (a full scan would
+                        // import held-back script writes mid play/test span); registers the new
+                        // folder so the shader write below can be imported into it.
+                        Services.DeferredCompileService.ImportFolderNow("Assets/" + relativeDir);
                     }
                 }
                 catch (Exception e)
@@ -178,8 +180,11 @@ namespace MCPForUnity.Editor.Tools
             try
             {
                 File.WriteAllText(fullPath, contents, new System.Text.UTF8Encoding(false));
+                // The targeted import registers/compiles the shader (not a script-compile trigger);
+                // the belt-and-braces full refresh is funnelled so it cannot import held-back
+                // script writes mid play/test span.
                 AssetDatabase.ImportAsset(relativePath);
-                AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport); // Ensure Unity recognizes the new shader
+                Services.DeferredCompileService.RequestRefresh("manage_shader_create");
                 return new SuccessResponse(
                     $"Shader '{name}.shader' created successfully at '{relativePath}'.",
                     new { path = relativePath }
@@ -246,8 +251,9 @@ namespace MCPForUnity.Editor.Tools
             try
             {
                 File.WriteAllText(fullPath, contents, new System.Text.UTF8Encoding(false));
+                // Funnelled full refresh; see the create-path comment above.
                 AssetDatabase.ImportAsset(relativePath);
-                AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
+                Services.DeferredCompileService.RequestRefresh("manage_shader_update");
                 return new SuccessResponse(
                     $"Shader '{Path.GetFileName(relativePath)}' updated successfully.",
                     new { path = relativePath }

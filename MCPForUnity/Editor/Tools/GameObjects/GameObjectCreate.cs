@@ -301,7 +301,8 @@ namespace MCPForUnity.Editor.Tools.GameObjects
                     if (!string.IsNullOrEmpty(directoryPath) && !System.IO.Directory.Exists(directoryPath))
                     {
                         System.IO.Directory.CreateDirectory(directoryPath);
-                        AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
+                        // Compile-safe folder registration; see DeferredCompileService.ImportFolderNow.
+                        Services.DeferredCompileService.ImportFolderNow(directoryPath);
                         McpLog.Info($"[ManageGameObject.Create] Created directory for prefab: {directoryPath}");
                     }
 

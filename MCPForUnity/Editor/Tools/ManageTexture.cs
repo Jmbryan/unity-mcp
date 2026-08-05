@@ -1106,7 +1106,8 @@ namespace MCPForUnity.Editor.Tools
             if (!string.IsNullOrEmpty(directory) && !Directory.Exists(GetAbsolutePath(directory)))
             {
                 Directory.CreateDirectory(GetAbsolutePath(directory));
-                AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
+                // Compile-safe folder registration; see DeferredCompileService.ImportFolderNow.
+                Services.DeferredCompileService.ImportFolderNow(directory);
             }
         }
 

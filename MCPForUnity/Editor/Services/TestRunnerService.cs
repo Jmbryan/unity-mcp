@@ -220,8 +220,10 @@ namespace MCPForUnity.Editor.Services
 
                 _leafResults.Clear();
                 _runCompletionSource = new TaskCompletionSource<TestRunResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-                // Mark running immediately so readiness snapshots reflect the busy state even before callbacks fire.
-                TestRunStatus.MarkStarted(mode);
+                // Mark running immediately so readiness snapshots reflect the busy state even before
+                // callbacks fire. Passing the tracked job id lets TestRunStatus persist a snapshot
+                // that survives a mid-run domain reload (restored only while the job stays live).
+                TestRunStatus.MarkStarted(mode, TestJobManager.CurrentJobId);
 
                 var filter = new Filter
                 {
@@ -304,13 +306,17 @@ namespace MCPForUnity.Editor.Services
             _leafResults.Clear();
             try
             {
-                // Best-effort progress info for async polling (avoid heavy payloads).
+                // Best-effort progress info for async polling (avoid heavy payloads). The mode lets
+                // TestJobManager reconcile a late start against an init-timeout tombstone of the
+                // same mode without adopting an unrelated run.
                 int? total = null;
+                string mode = null;
                 if (testsToRun != null)
                 {
                     total = CountLeafTests(testsToRun);
+                    try { mode = testsToRun.TestMode.ToString(); } catch { }
                 }
-                TestJobManager.OnRunStarted(total);
+                TestJobManager.OnRunStarted(total, mode);
             }
             catch
             {

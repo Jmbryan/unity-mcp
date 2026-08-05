@@ -1226,7 +1226,10 @@ namespace MCPForUnity.Editor.Tools
                 bool deleted = AssetDatabase.MoveAssetToTrash(relativePath);
                 if (deleted)
                 {
-                    AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
+                    // Deleting a script recompiles; route the follow-up refresh through the defer
+                    // funnel so it cannot also import other held-back script writes while a
+                    // play/test span is active (explicit Refresh bypasses DisallowAutoRefresh).
+                    DeferredCompileService.RequestRefresh("delete_script");
                     return new SuccessResponse(
                         $"Script '{Path.GetFileName(relativePath)}' moved to trash successfully.",
                         new { deleted = true }

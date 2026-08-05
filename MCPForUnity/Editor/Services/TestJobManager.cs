@@ -41,6 +41,9 @@ namespace MCPForUnity.Editor.Services
         public string Error { get; set; }
         public TestRunResult Result { get; set; }
         public long InitTimeoutMs { get; set; }
+
+        /// <summary>Display label of the session/agent that started this job; null when unknown.</summary>
+        public string StartedBy { get; set; }
     }
 
     /// <summary>
@@ -51,8 +54,12 @@ namespace MCPForUnity.Editor.Services
         // Keep this small to avoid ballooning payloads during polling.
         private const int FailureCap = 25;
         private const long StuckThresholdMs = 60_000;
-        private const long DefaultInitializationTimeoutMs = 15_000; // 15 seconds default; override per-job via run_tests init_timeout param
+        private const long DefaultInitializationTimeoutMs = 60_000; // 60 seconds default (large projects need the headroom); override per-job via run_tests init_timeout param
         private const long MaxInitializationTimeoutMs = 600_000; // 10 minutes hard cap
+
+        // Stable error text for init-timeout auto-fails; also the marker that qualifies a job for
+        // tombstone reconciliation when the real run turns out to still be starting.
+        private const string InitTimeoutError = "Test job failed to initialize (tests did not start within timeout)";
         private const int MaxJobsToKeep = 10;
         private const long MinPersistIntervalMs = 1000; // Throttle persistence to reduce overhead
 
@@ -64,6 +71,13 @@ namespace MCPForUnity.Editor.Services
         private static readonly Dictionary<string, TestJob> Jobs = new();
         private static string _currentJobId;
         private static long _lastPersistUnixMs;
+
+        // Tombstone left by the init-timeout auto-fail (see GetJob). The auto-fail is a wall-clock
+        // guess: Unity may still be building the test tree when it fires, and the real run then
+        // starts against a cleared job. The tombstone lets a late RunStarted revive-and-adopt the
+        // job (and a late RunFinished adopt its result) instead of fighting the failed state.
+        // Superseded by any newer StartJob and cleared by ClearStuckJob.
+        private static string _autoFailedInitJobId;
 
         static TestJobManager()
         {
@@ -88,6 +102,25 @@ namespace MCPForUnity.Editor.Services
         }
 
         /// <summary>
+        /// Display label of the session/agent that started the currently tracked job, or null when
+        /// no job is tracked or the job carries no owner label (e.g. a Unity Test Runner UI run).
+        /// </summary>
+        public static string CurrentJobStartedBy
+        {
+            get
+            {
+                lock (LockObj)
+                {
+                    if (string.IsNullOrEmpty(_currentJobId) || !Jobs.TryGetValue(_currentJobId, out var job))
+                    {
+                        return null;
+                    }
+                    return string.IsNullOrWhiteSpace(job.StartedBy) ? null : job.StartedBy;
+                }
+            }
+        }
+
+        /// <summary>
         /// Force-clears any stuck or orphaned test job. Call this when tests get stuck due to
         /// assembly reloads or other interruptions.
         /// </summary>
@@ -101,7 +134,9 @@ namespace MCPForUnity.Editor.Services
                 {
                     // No tracked job, but the run flag can still be wedged from an
                     // earlier clear that dropped the id without it. clear_stuck is the
-                    // only manual lever, so reconcile here too.
+                    // only manual lever, so reconcile here too. MarkFinished also erases
+                    // the persisted reload snapshot so the wedge cannot come back.
+                    _autoFailedInitJobId = null;
                     if (TestRunStatus.IsRunning)
                     {
                         McpLog.Warn("[TestJobManager] No tracked test job, but the test-run flag was still set; clearing it");
@@ -122,9 +157,12 @@ namespace MCPForUnity.Editor.Services
                 }
 
                 _currentJobId = null;
+                _autoFailedInitJobId = null;
                 // Clearing the job id without clearing the run flag wedges the editor:
                 // TestRunStatus.IsRunning stays true forever, and every exclusive-class
                 // MCP call (run_tests included) then parks behind a phantom test run.
+                // MarkFinished also erases TestRunStatus's persisted reload snapshot,
+                // so the cleared wedge cannot resurrect across a domain reload.
                 TestRunStatus.MarkFinished();
             }
             PersistToSessionState(force: true);
@@ -134,6 +172,7 @@ namespace MCPForUnity.Editor.Services
         private sealed class PersistedState
         {
             public string current_job_id { get; set; }
+            public string auto_failed_init_job_id { get; set; }
             public List<PersistedJob> jobs { get; set; }
         }
 
@@ -154,6 +193,7 @@ namespace MCPForUnity.Editor.Services
             public List<TestJobFailure> failures_so_far { get; set; }
             public string error { get; set; }
             public long init_timeout_ms { get; set; }
+            public string started_by { get; set; }
         }
 
         private static TestJobStatus ParseStatus(string status)
@@ -217,12 +257,20 @@ namespace MCPForUnity.Editor.Services
                             FailuresSoFar = pj.failures_so_far ?? new List<TestJobFailure>(),
                             Error = pj.error,
                             InitTimeoutMs = pj.init_timeout_ms,
+                            StartedBy = pj.started_by,
                             // Intentionally not persisted to avoid ballooning SessionState.
                             Result = null
                         };
                     }
 
                     _currentJobId = string.IsNullOrWhiteSpace(state.current_job_id) ? null : state.current_job_id;
+                    _autoFailedInitJobId = string.IsNullOrWhiteSpace(state.auto_failed_init_job_id)
+                        ? null
+                        : state.auto_failed_init_job_id;
+                    if (!string.IsNullOrEmpty(_autoFailedInitJobId) && !Jobs.ContainsKey(_autoFailedInitJobId))
+                    {
+                        _autoFailedInitJobId = null;
+                    }
                     if (!string.IsNullOrEmpty(_currentJobId) && !Jobs.ContainsKey(_currentJobId))
                     {
                         _currentJobId = null;
@@ -290,13 +338,15 @@ namespace MCPForUnity.Editor.Services
                             last_finished_unix_ms = j.LastFinishedUnixMs,
                             failures_so_far = (j.FailuresSoFar ?? new List<TestJobFailure>()).Take(FailureCap).ToList(),
                             error = j.Error,
-                            init_timeout_ms = j.InitTimeoutMs
+                            init_timeout_ms = j.InitTimeoutMs,
+                            started_by = j.StartedBy
                         })
                         .ToList();
 
                     snapshot = new PersistedState
                     {
                         current_job_id = _currentJobId,
+                        auto_failed_init_job_id = _autoFailedInitJobId,
                         jobs = jobs
                     };
                 }
@@ -311,7 +361,7 @@ namespace MCPForUnity.Editor.Services
             }
         }
 
-        public static string StartJob(TestMode mode, TestFilterOptions filterOptions = null, long initTimeoutMs = 0)
+        public static string StartJob(TestMode mode, TestFilterOptions filterOptions = null, long initTimeoutMs = 0, string startedBy = null)
         {
             // Clamp to valid range: non-positive values mean "use default", cap at 10 minutes
             if (initTimeoutMs < 0) initTimeoutMs = 0;
@@ -338,7 +388,8 @@ namespace MCPForUnity.Editor.Services
                 FailuresSoFar = new List<TestJobFailure>(),
                 Error = null,
                 Result = null,
-                InitTimeoutMs = initTimeoutMs
+                InitTimeoutMs = initTimeoutMs,
+                StartedBy = string.IsNullOrWhiteSpace(startedBy) ? null : startedBy.Trim()
             };
 
             // Single lock scope for check-and-set to avoid TOCTOU race
@@ -350,6 +401,9 @@ namespace MCPForUnity.Editor.Services
                 }
                 Jobs[jobId] = job;
                 _currentJobId = jobId;
+                // A fresh job supersedes any init-timeout tombstone: late callbacks from the old
+                // run can no longer be disambiguated once a new run is admitted.
+                _autoFailedInitJobId = null;
             }
             PersistToSessionState(force: true);
 
@@ -381,9 +435,22 @@ namespace MCPForUnity.Editor.Services
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             lock (LockObj)
             {
-                if (string.IsNullOrEmpty(_currentJobId) || !Jobs.TryGetValue(_currentJobId, out var job))
+                TestJob job = null;
+                if (!string.IsNullOrEmpty(_currentJobId))
                 {
-                    return;
+                    Jobs.TryGetValue(_currentJobId, out job);
+                }
+
+                if (job == null)
+                {
+                    // A late RunFinished for a job the init-timeout auto-fail already cleared:
+                    // adopt the result into the tombstoned job instead of discarding the run.
+                    job = TakeAutoFailedInitJobLocked(now, mode: null);
+                    if (job == null)
+                    {
+                        return;
+                    }
+                    McpLog.Warn($"[TestJobManager] Late run finish for auto-failed job {job.JobId}; adopting its result");
                 }
 
                 job.LastUpdateUnixMs = now;
@@ -399,14 +466,78 @@ namespace MCPForUnity.Editor.Services
             PersistToSessionState(force: true);
         }
 
-        public static void OnRunStarted(int? totalTests)
+        /// <summary>
+        /// Validates and consumes the init-timeout tombstone. Returns the tombstoned job when a late
+        /// run event may legitimately belong to it — status still the auto-fail failure, tombstone
+        /// younger than the 10-minute init hard cap, and (when known) matching test mode — otherwise
+        /// null. The tombstone is cleared whenever it is consumed or found invalid, so it can only
+        /// ever reconcile one late run. Must be called while holding <see cref="LockObj"/>.
+        /// </summary>
+        private static TestJob TakeAutoFailedInitJobLocked(long now, string mode)
+        {
+            if (string.IsNullOrEmpty(_autoFailedInitJobId))
+            {
+                return null;
+            }
+
+            if (!Jobs.TryGetValue(_autoFailedInitJobId, out var job)
+                || job.Status != TestJobStatus.Failed
+                || !string.Equals(job.Error, InitTimeoutError, StringComparison.Ordinal)
+                || now - job.StartedUnixMs > MaxInitializationTimeoutMs)
+            {
+                _autoFailedInitJobId = null;
+                return null;
+            }
+
+            if (!string.IsNullOrEmpty(mode) && !string.Equals(mode, job.Mode, StringComparison.OrdinalIgnoreCase))
+            {
+                // A run of a different mode cannot be the tombstoned job's late start; leave the
+                // tombstone in place for the run it actually belongs to.
+                return null;
+            }
+
+            _autoFailedInitJobId = null;
+            return job;
+        }
+
+        public static void OnRunStarted(int? totalTests, string mode = null)
         {
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            bool revived = false;
+            string revivedJobId = null;
+            TestMode revivedMode = default;
+            bool rearmRunFlag = false;
             lock (LockObj)
             {
-                if (string.IsNullOrEmpty(_currentJobId) || !Jobs.TryGetValue(_currentJobId, out var job))
+                TestJob job = null;
+                if (!string.IsNullOrEmpty(_currentJobId))
                 {
-                    return;
+                    Jobs.TryGetValue(_currentJobId, out job);
+                }
+
+                if (job == null)
+                {
+                    // The run whose start we are seeing was auto-failed by the init timeout while
+                    // Unity was still building the test tree. Revive-and-adopt: the job returns to
+                    // Running, becomes current again, and the run flag is re-armed so the defer
+                    // funnel and readiness snapshots cover the rest of the run.
+                    job = TakeAutoFailedInitJobLocked(now, mode);
+                    if (job == null)
+                    {
+                        return;
+                    }
+
+                    job.Status = TestJobStatus.Running;
+                    job.Error = null;
+                    job.FinishedUnixMs = null;
+                    _currentJobId = job.JobId;
+                    revived = true;
+                    revivedJobId = job.JobId;
+                    if (Enum.TryParse<TestMode>(job.Mode, ignoreCase: true, out revivedMode))
+                    {
+                        rearmRunFlag = !TestRunStatus.IsRunning;
+                    }
+                    McpLog.Warn($"[TestJobManager] Late run start for auto-failed job {job.JobId}; reviving and adopting the live run");
                 }
 
                 job.LastUpdateUnixMs = now;
@@ -418,6 +549,14 @@ namespace MCPForUnity.Editor.Services
                 job.LastFinishedUnixMs = null;
                 job.FailuresSoFar ??= new List<TestJobFailure>();
                 job.FailuresSoFar.Clear();
+            }
+
+            if (revived && rearmRunFlag)
+            {
+                // The auto-fail cleared the run flag while the run was in fact still starting;
+                // re-arm it (outside the lock — MarkStarted takes its own lock and touches
+                // SessionState) so the gate and defer funnel cover the adopted run.
+                TestRunStatus.MarkStarted(revivedMode, revivedJobId);
             }
             PersistToSessionState(force: true);
         }
@@ -509,7 +648,7 @@ namespace MCPForUnity.Editor.Services
 
                 // Check if job is stuck in "running" state without having called OnRunStarted (TotalTests still null).
                 // This happens when tests fail to initialize (e.g., unsaved scene, compilation issues).
-                // After 15 seconds without initialization, auto-fail the job to prevent hanging.
+                // Once the init timeout elapses without initialization, auto-fail the job to prevent hanging.
                 if (job.Status == TestJobStatus.Running && job.TotalTests == null)
                 {
                     long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -518,9 +657,18 @@ namespace MCPForUnity.Editor.Services
                     {
                         McpLog.Warn($"[TestJobManager] Job {jobId} failed to initialize within {initTimeout}ms, auto-failing");
                         job.Status = TestJobStatus.Failed;
-                        job.Error = "Test job failed to initialize (tests did not start within timeout)";
+                        job.Error = InitTimeoutError;
                         job.FinishedUnixMs = now;
                         job.LastUpdateUnixMs = now;
+                        // Wall-clock auto-fail is a guess: Unity may still be building the test
+                        // tree, and the real run can start after this fires. Leave a tombstone so a
+                        // late RunStarted/RunFinished reconciles cleanly (revive-and-adopt) instead
+                        // of fighting the failed state. Only when no newer job owns the tracking —
+                        // once another run is admitted, late callbacks are unattributable.
+                        if (string.IsNullOrEmpty(_currentJobId) || _currentJobId == jobId)
+                        {
+                            _autoFailedInitJobId = jobId;
+                        }
                         if (_currentJobId == jobId)
                         {
                             _currentJobId = null;
@@ -653,6 +801,7 @@ namespace MCPForUnity.Editor.Services
 
         private static void FinalizeFromTask(string jobId, Task<TestRunResult> task)
         {
+            bool clearRunFlag = false;
             lock (LockObj)
             {
                 if (!Jobs.TryGetValue(jobId, out var existing))
@@ -697,6 +846,18 @@ namespace MCPForUnity.Editor.Services
                 {
                     _currentJobId = null;
                 }
+
+                // This safety net fires when RunFinished was never delivered (faulted/cancelled
+                // run task), so nothing else will balance MarkStarted. Leaving the flag set here
+                // is exactly the wedge shape ClearStuckJob and the init-timeout path already
+                // reconcile — clear it whenever no job remains active.
+                clearRunFlag = string.IsNullOrEmpty(_currentJobId) && TestRunStatus.IsRunning;
+            }
+
+            if (clearRunFlag)
+            {
+                McpLog.Warn("[TestJobManager] Run task finalized without RunFinished; clearing the test-run flag");
+                TestRunStatus.MarkFinished();
             }
             PersistToSessionState(force: true);
         }

@@ -25,6 +25,7 @@ namespace MCPForUnity.Editor.Tools
             bool waitForReady = ParamCoercion.CoerceBool(@params?["wait_for_ready"], false);
 
             bool refreshTriggered = false;
+            bool refreshDeferred = false;
             bool compileRequested = false;
             bool compileDeferred = false;
 
@@ -43,8 +44,14 @@ namespace MCPForUnity.Editor.Tools
                     }
                     else
                     {
-                        AssetDatabase.Refresh(ImportAssetOptions.ForceUpdate | ImportAssetOptions.ForceSynchronousImport);
-                        refreshTriggered = true;
+                        // Defer-don't-leak: an explicit AssetDatabase.Refresh is NOT suppressed by
+                        // DisallowAutoRefresh, so mid play/test span it would import every held-back
+                        // script write. Route through the funnel: fires immediately when idle,
+                        // otherwise records a pending refresh that flushes on return to idle.
+                        refreshDeferred = DeferredCompileService.RequestRefresh(
+                            "refresh_unity",
+                            ImportAssetOptions.ForceUpdate | ImportAssetOptions.ForceSynchronousImport);
+                        refreshTriggered = !refreshDeferred;
                     }
                 }
 
@@ -57,13 +64,15 @@ namespace MCPForUnity.Editor.Tools
                     compileRequested = true;
                 }
 
-                if (string.Equals(scope, "all", StringComparison.OrdinalIgnoreCase) && !refreshTriggered)
+                if (string.Equals(scope, "all", StringComparison.OrdinalIgnoreCase) && !refreshTriggered && !refreshDeferred)
                 {
                     // If the caller asked for "all" and we skipped refresh above (e.g., scripts-only path),
-                    // do a lightweight refresh now. Use ForceSynchronousImport to ensure the refresh
-                    // completes before returning, preventing stalls when Unity is backgrounded.
-                    AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
-                    refreshTriggered = true;
+                    // do a lightweight refresh now (funnelled for the same reason as above). Use
+                    // ForceSynchronousImport to ensure the refresh completes before returning,
+                    // preventing stalls when Unity is backgrounded.
+                    refreshDeferred = DeferredCompileService.RequestRefresh(
+                        "refresh_unity", ImportAssetOptions.ForceSynchronousImport);
+                    refreshTriggered = !refreshDeferred;
                 }
             }
             catch (Exception ex)
@@ -77,11 +86,11 @@ namespace MCPForUnity.Editor.Tools
             // When compilation is requested, return immediately and let client poll editor_state.
             // Earlier Unity versions retain the original behavior.
 #if UNITY_6000_0_OR_NEWER
-            bool shouldWaitForReady = waitForReady && !compileRequested;
+            bool shouldWaitForReady = waitForReady && !compileRequested && !refreshDeferred;
 #else
-            // Never block on readiness when the compile was deferred — nothing will run until the
-            // blocking play/test span ends, so the wait would only time out.
-            bool shouldWaitForReady = waitForReady && !compileDeferred;
+            // Never block on readiness when the compile or refresh was deferred — nothing will run
+            // until the blocking play/test span ends, so the wait would only time out.
+            bool shouldWaitForReady = waitForReady && !compileDeferred && !refreshDeferred;
 #endif
             if (shouldWaitForReady)
             {
@@ -112,11 +121,12 @@ namespace MCPForUnity.Editor.Tools
             return new SuccessResponse("Refresh requested.", new
             {
                 refresh_triggered = refreshTriggered,
+                refresh_deferred = refreshDeferred,
                 compile_requested = compileRequested,
                 compile_deferred = compileDeferred,
                 resulting_state = resultingState,
-                hint = compileDeferred
-                    ? "Compile deferred while play mode / a test run is active; it will flush automatically on return to idle. Poll the mcpforunity://editor/state resource until data.compilation.deferred_compile_pending clears."
+                hint = (compileDeferred || refreshDeferred)
+                    ? "Refresh/compile deferred while play mode / a test run is active; it will flush automatically on return to idle. Poll the mcpforunity://editor/state resource until data.compilation.deferred_compile_pending clears."
                     : (shouldWaitForReady
                         ? "Unity refresh completed; editor should be ready."
                         : "If Unity enters compilation/domain reload, poll the mcpforunity://editor/state resource until data.advice.ready_for_tools is true.")

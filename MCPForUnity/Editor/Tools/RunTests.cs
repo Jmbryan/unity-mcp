@@ -46,7 +46,15 @@ namespace MCPForUnity.Editor.Tools
 
                 var filterOptions = GetFilterOptions(@params);
                 long initTimeoutMs = p.GetInt("initTimeout") ?? 0;
-                string jobId = TestJobManager.StartJob(parsedMode.Value, filterOptions, initTimeoutMs);
+                // Owner attribution: the server forwards the initiating session's display label so
+                // editor-state snapshots (tests.started_by) can name who is running tests. Absent
+                // when the caller does not supply one (falls back to "unknown" in the snapshot).
+                string startedBy = @params?["startedBy"]?.ToString();
+                if (string.IsNullOrWhiteSpace(startedBy))
+                {
+                    startedBy = @params?["started_by"]?.ToString();
+                }
+                string jobId = TestJobManager.StartJob(parsedMode.Value, filterOptions, initTimeoutMs, startedBy);
 
                 return Task.FromResult<object>(new SuccessResponse("Test job started.", new
                 {

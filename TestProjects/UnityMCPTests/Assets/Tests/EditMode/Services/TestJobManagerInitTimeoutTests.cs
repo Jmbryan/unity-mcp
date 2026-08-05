@@ -14,6 +14,7 @@ namespace MCPForUnityTests.Editor.Services
     {
         private FieldInfo _jobsField;
         private FieldInfo _currentJobIdField;
+        private FieldInfo _autoFailedField;
         private MethodInfo _getJobMethod;
         private MethodInfo _persistMethod;
         private MethodInfo _restoreMethod;
@@ -37,6 +38,9 @@ namespace MCPForUnityTests.Editor.Services
             _currentJobIdField = managerType.GetField("_currentJobId", BindingFlags.NonPublic | BindingFlags.Static);
             Assert.NotNull(_currentJobIdField, "Could not find _currentJobId field");
 
+            _autoFailedField = managerType.GetField("_autoFailedInitJobId", BindingFlags.NonPublic | BindingFlags.Static);
+            Assert.NotNull(_autoFailedField, "Could not find _autoFailedInitJobId field");
+
             _getJobMethod = managerType.GetMethod("GetJob", BindingFlags.NonPublic | BindingFlags.Static);
             Assert.NotNull(_getJobMethod, "Could not find GetJob method");
 
@@ -56,6 +60,7 @@ namespace MCPForUnityTests.Editor.Services
         {
             // Restore original state
             _currentJobIdField.SetValue(null, _originalJobId);
+            _autoFailedField.SetValue(null, null); // auto-fail tests leave a tombstone; never leak it
             // Clean up any test jobs we inserted
             var jobs = _jobsField.GetValue(null) as System.Collections.IDictionary;
             jobs?.Remove("test-init-timeout-job");
@@ -71,7 +76,7 @@ namespace MCPForUnityTests.Editor.Services
         public void GetJob_WithCustomInitTimeout_UsesPerJobTimeout()
         {
             // Arrange: insert a job with a custom init timeout and a start time far enough in the
-            // past to exceed the default 15s but within the custom 120s.
+            // past to exceed the default 60s but within the custom 120s.
             var jobs = _jobsField.GetValue(null) as System.Collections.IDictionary;
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
@@ -79,8 +84,8 @@ namespace MCPForUnityTests.Editor.Services
             _testJobType.GetProperty("JobId").SetValue(job, "test-init-timeout-job");
             _testJobType.GetProperty("Status").SetValue(job, TestJobStatus.Running);
             _testJobType.GetProperty("Mode").SetValue(job, "PlayMode");
-            _testJobType.GetProperty("StartedUnixMs").SetValue(job, now - 30_000); // 30s ago
-            _testJobType.GetProperty("LastUpdateUnixMs").SetValue(job, now - 30_000);
+            _testJobType.GetProperty("StartedUnixMs").SetValue(job, now - 90_000); // 90s ago: past the 60s default
+            _testJobType.GetProperty("LastUpdateUnixMs").SetValue(job, now - 90_000);
             _testJobType.GetProperty("TotalTests").SetValue(job, null); // Not initialized yet
             _testJobType.GetProperty("InitTimeoutMs").SetValue(job, 120_000L); // 120s custom timeout
             _testJobType.GetProperty("FailuresSoFar").SetValue(job, new List<TestJobFailure>());
@@ -88,19 +93,19 @@ namespace MCPForUnityTests.Editor.Services
             jobs["test-init-timeout-job"] = job;
             _currentJobIdField.SetValue(null, "test-init-timeout-job");
 
-            // Act: GetJob should NOT auto-fail because 30s < 120s custom timeout
+            // Act: GetJob should NOT auto-fail because 90s < 120s custom timeout
             var result = _getJobMethod.Invoke(null, new object[] { "test-init-timeout-job" });
 
             // Assert: job should still be running
             var status = (TestJobStatus)_testJobType.GetProperty("Status").GetValue(result);
             Assert.AreEqual(TestJobStatus.Running, status,
-                "Job with 120s custom timeout should not auto-fail after 30s");
+                "Job with 120s custom timeout should not auto-fail after 90s");
         }
 
         [Test]
-        public void GetJob_WithDefaultTimeout_AutoFailsAfter15Seconds()
+        public void GetJob_WithDefaultTimeout_AutoFailsAfterDefaultTimeout()
         {
-            // Arrange: insert a job with InitTimeoutMs=0 (use default) and start time 20s ago
+            // Arrange: insert a job with InitTimeoutMs=0 (use default) and start time 70s ago
             var jobs = _jobsField.GetValue(null) as System.Collections.IDictionary;
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
@@ -108,8 +113,8 @@ namespace MCPForUnityTests.Editor.Services
             _testJobType.GetProperty("JobId").SetValue(job, "test-init-timeout-default");
             _testJobType.GetProperty("Status").SetValue(job, TestJobStatus.Running);
             _testJobType.GetProperty("Mode").SetValue(job, "EditMode");
-            _testJobType.GetProperty("StartedUnixMs").SetValue(job, now - 20_000); // 20s ago
-            _testJobType.GetProperty("LastUpdateUnixMs").SetValue(job, now - 20_000);
+            _testJobType.GetProperty("StartedUnixMs").SetValue(job, now - 70_000); // 70s ago: past the 60s default
+            _testJobType.GetProperty("LastUpdateUnixMs").SetValue(job, now - 70_000);
             _testJobType.GetProperty("TotalTests").SetValue(job, null);
             _testJobType.GetProperty("InitTimeoutMs").SetValue(job, 0L); // Use default
             _testJobType.GetProperty("FailuresSoFar").SetValue(job, new List<TestJobFailure>());
@@ -117,13 +122,13 @@ namespace MCPForUnityTests.Editor.Services
             jobs["test-init-timeout-default"] = job;
             _currentJobIdField.SetValue(null, "test-init-timeout-default");
 
-            // Act: GetJob should auto-fail because 20s > 15s default
+            // Act: GetJob should auto-fail because 70s > 60s default
             var result = _getJobMethod.Invoke(null, new object[] { "test-init-timeout-default" });
 
             // Assert: job should be failed
             var status = (TestJobStatus)_testJobType.GetProperty("Status").GetValue(result);
             Assert.AreEqual(TestJobStatus.Failed, status,
-                "Job with default timeout should auto-fail after 20s");
+                "Job with default timeout should auto-fail after 70s");
         }
 
         [Test]

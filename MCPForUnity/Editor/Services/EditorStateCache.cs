@@ -461,6 +461,7 @@ namespace MCPForUnity.Editor.Services
             bool testsRunning = TestRunStatus.IsRunning;
             var testsMode = TestRunStatus.Mode?.ToString();
             string currentJobId = TestJobManager.CurrentJobId;
+            string testsStartedBy = TestJobManager.CurrentJobStartedBy;
             bool isFocused = InternalEditorUtility.isApplicationActive;
 
             // Reconcile the play-mode transition from current EditorApplication facts rather than
@@ -560,7 +561,9 @@ namespace MCPForUnity.Editor.Services
                     Mode = testsMode,
                     CurrentJobId = string.IsNullOrEmpty(currentJobId) ? null : currentJobId,
                     StartedUnixMs = TestRunStatus.StartedUnixMs,
-                    StartedBy = "unknown",
+                    // Real owner when the tracked job carries one; "unknown" only when there is
+                    // genuinely no owner (e.g. a run started from the Unity Test Runner UI).
+                    StartedBy = string.IsNullOrEmpty(testsStartedBy) ? "unknown" : testsStartedBy,
                     LastRun = TestRunStatus.FinishedUnixMs.HasValue
                         ? new EditorStateLastRun
                         {

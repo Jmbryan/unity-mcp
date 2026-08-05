@@ -181,7 +181,10 @@ namespace MCPForUnity.Editor.Tools
             if (!Directory.Exists(Path.Combine(Directory.GetCurrentDirectory(), directory)))
             {
                 Directory.CreateDirectory(Path.Combine(Directory.GetCurrentDirectory(), directory));
-                AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport); // Make sure Unity knows about the new folder
+                // Targeted folder import instead of a full refresh: a full AssetDatabase.Refresh
+                // scan imports held-back script writes mid play/test span (it is not suppressed by
+                // DisallowAutoRefresh), while registering just the new folder is compile-safe.
+                Services.DeferredCompileService.ImportFolderNow(directory);
             }
 
             if (AssetExists(fullPath))
@@ -870,7 +873,8 @@ namespace MCPForUnity.Editor.Tools
             if (!Directory.Exists(fullDirPath))
             {
                 Directory.CreateDirectory(fullDirPath);
-                AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport); // Let Unity know about the new folder
+                // Compile-safe folder registration; see DeferredCompileService.ImportFolderNow.
+                Services.DeferredCompileService.ImportFolderNow(directoryPath);
             }
         }
 

@@ -100,7 +100,10 @@ namespace MCPForUnity.Editor.Tools.Vfx
                 {
                     return new { success = false, message = $"Failed to copy VFX template from {templateAssetPath}" };
                 }
-                AssetDatabase.Refresh();
+                // Targeted import instead of a full refresh: the load below needs the copy
+                // registered NOW, and a .vfx import is not a script-compile trigger, whereas a full
+                // AssetDatabase.Refresh scan would import held-back script writes mid play/test span.
+                AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceSynchronousImport);
                 newAsset = AssetDatabase.LoadAssetAtPath<VisualEffectAsset>(assetPath);
             }
             else

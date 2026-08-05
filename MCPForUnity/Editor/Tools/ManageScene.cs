@@ -354,7 +354,10 @@ namespace MCPForUnity.Editor.Tools
 
                 if (saved)
                 {
-                    AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport); // Ensure Unity sees the new scene file
+                    // SaveScene already registers the scene asset; this belt-and-braces refresh is
+                    // funnelled so it cannot import held-back script writes mid play/test span
+                    // (explicit Refresh is not suppressed by DisallowAutoRefresh).
+                    Services.DeferredCompileService.RequestRefresh("manage_scene_create");
                     return new SuccessResponse(
                         $"Scene '{Path.GetFileName(relativePath)}' created successfully at '{relativePath}'.",
                         new { path = relativePath }
@@ -497,7 +500,8 @@ namespace MCPForUnity.Editor.Tools
 
                 if (saved)
                 {
-                    AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
+                    // Funnelled: see the create-path comment above.
+                    Services.DeferredCompileService.RequestRefresh("manage_scene_save");
                     return new SuccessResponse(
                         $"Scene '{currentScene.name}' saved successfully to '{finalPath}'.",
                         new { path = finalPath, name = currentScene.name }

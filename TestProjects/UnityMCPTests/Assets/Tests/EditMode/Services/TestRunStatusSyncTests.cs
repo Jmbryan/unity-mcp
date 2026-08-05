@@ -21,6 +21,7 @@ namespace MCPForUnityTests.Editor.Services
     {
         private FieldInfo _jobsField;
         private FieldInfo _currentJobIdField;
+        private FieldInfo _autoFailedField;
         private MethodInfo _persistMethod;
 
         private FieldInfo _statusIsRunning;
@@ -43,9 +44,11 @@ namespace MCPForUnityTests.Editor.Services
             Assert.NotNull(managerType, "Could not find TestJobManager");
             _jobsField = managerType.GetField("Jobs", BindingFlags.NonPublic | BindingFlags.Static);
             _currentJobIdField = managerType.GetField("_currentJobId", BindingFlags.NonPublic | BindingFlags.Static);
+            _autoFailedField = managerType.GetField("_autoFailedInitJobId", BindingFlags.NonPublic | BindingFlags.Static);
             _persistMethod = managerType.GetMethod("PersistToSessionState", BindingFlags.NonPublic | BindingFlags.Static);
             Assert.NotNull(_jobsField, "Could not find Jobs field");
             Assert.NotNull(_currentJobIdField, "Could not find _currentJobId field");
+            Assert.NotNull(_autoFailedField, "Could not find _autoFailedInitJobId field");
             Assert.NotNull(_persistMethod, "Could not find PersistToSessionState method");
 
             var statusType = asm.GetType("MCPForUnity.Editor.Services.TestRunStatus");
@@ -78,6 +81,7 @@ namespace MCPForUnityTests.Editor.Services
             _statusFinished.SetValue(null, _originalStatus[3]);
 
             _currentJobIdField.SetValue(null, _originalJobId);
+            _autoFailedField.SetValue(null, null); // auto-fail tests leave a tombstone; never leak it
             var jobs = Jobs();
             jobs.Remove(JobA);
             jobs.Remove(JobB);
@@ -149,13 +153,13 @@ namespace MCPForUnityTests.Editor.Services
         {
             // The wedge shape: the id was dropped by an earlier clear, but the run flag
             // survived, so the id guard on the auto-fail path no longer matches.
-            Jobs()[JobA] = NewJob(JobA, startedMsAgo: 20_000, totalTests: null);
+            Jobs()[JobA] = NewJob(JobA, startedMsAgo: 70_000, totalTests: null);
             _currentJobIdField.SetValue(null, null);
             TestRunStatus.MarkStarted(TestMode.EditMode);
 
             var job = TestJobManager.GetJob(JobA);
 
-            Assert.AreEqual(TestJobStatus.Failed, job.Status, "An uninitialized job past 15s auto-fails");
+            Assert.AreEqual(TestJobStatus.Failed, job.Status, "An uninitialized job past the 60s default auto-fails");
             Assert.IsFalse(TestRunStatus.IsRunning,
                 "The init-timeout auto-fail must clear the run flag even when the id guard misses");
         }
@@ -163,7 +167,7 @@ namespace MCPForUnityTests.Editor.Services
         [Test]
         public void GetJob_InitTimeout_KeepsRunFlag_WhenNewerJobIsActive()
         {
-            Jobs()[JobA] = NewJob(JobA, startedMsAgo: 20_000, totalTests: null);
+            Jobs()[JobA] = NewJob(JobA, startedMsAgo: 70_000, totalTests: null);
             Jobs()[JobB] = NewJob(JobB, startedMsAgo: 1_000, totalTests: 4);
             _currentJobIdField.SetValue(null, JobB);
             TestRunStatus.MarkStarted(TestMode.EditMode);
