@@ -722,7 +722,9 @@ class UnityInstanceMiddleware(Middleware):
         dispatched play call records an intent (so the lease attributes
         correctly even when the play-enter domain reload eats the result),
         and observed play/pause/stop outcomes acquire, renew, or release the
-        lease implicitly.
+        lease implicitly. A dispatched play-owning plugin tool gets the same
+        treatment through :meth:`_note_plugin_play_dispatch` — its play
+        transition is invisible to argument inspection.
 
         A busy verdict is raised as a ToolError rather than returned. A
         short-circuited call never reaches ``Tool.convert_result``, so a
@@ -733,10 +735,16 @@ class UnityInstanceMiddleware(Middleware):
         bypasses output validation for every tool regardless of its schema.
         """
         await self._inject_unity_instance(context)
+        tool_name, arguments = self._tool_call_shape(context)
+        plugin_play = await self._note_plugin_play_dispatch(context, tool_name)
         busy = await self._gate_tool_call(context)
         if busy is not None:
             from fastmcp.exceptions import ToolError
 
+            if plugin_play:
+                # The refused call never dispatches: drop the speculative
+                # intent so it cannot misattribute the next play transition.
+                await self._drop_plugin_play_intent(context)
             message = busy.get("error") or "Editor is busy; retry shortly."
             data = busy.get("data")
             if isinstance(data, dict):
@@ -748,7 +756,6 @@ class UnityInstanceMiddleware(Middleware):
                 if detail:
                     message = f"{message} ({detail})"
             raise ToolError(message)
-        tool_name, arguments = self._tool_call_shape(context)
         session_key: str | None = None
         if tool_name is not None:
             try:
@@ -766,6 +773,8 @@ class UnityInstanceMiddleware(Middleware):
         finally:
             self._mark_call_end(session_key)
         await self._observe_play_result(context, tool_name, arguments, result)
+        if plugin_play:
+            await self._settle_plugin_play_edge(context)
         return result
 
     @staticmethod
@@ -811,6 +820,109 @@ class UnityInstanceMiddleware(Middleware):
                 raise
             _diag.debug(
                 "play-lease intent recording failed open (%s)",
+                type(exc).__name__,
+                exc_info=True,
+            )
+
+    @staticmethod
+    async def _gate_state(ctx) -> tuple[str | None, str | None]:
+        """(unity_instance, user_id) from context state; either may be None."""
+        unity_instance = None
+        user_id = None
+        get_state = getattr(ctx, "get_state", None)
+        if callable(get_state):
+            try:
+                unity_instance = await get_state("unity_instance")
+            except Exception:
+                unity_instance = None
+            try:
+                user_id = await get_state("user_id")
+            except Exception:
+                user_id = None
+        return unity_instance, user_id
+
+    async def _note_plugin_play_dispatch(self, context, tool_name) -> bool:
+        """Record a play intent for a play-owning plugin tool. Fails open.
+
+        Plugin tools dispatch straight through this middleware rather than the
+        custom-tool wrapper, so a driver that enters play mode leaves the
+        transition with no MCP cause and the lease falls through to "user" —
+        which then refuses the automation's own play-scoped calls, its cleanup
+        stop included. Returns True when an intent was recorded, so the caller
+        drops it if the gate refuses and settles the edge after dispatch.
+        """
+        if tool_name is None:
+            return False
+        try:
+            ctx = context.fastmcp_context
+            unity_instance, user_id = await self._gate_state(ctx)
+
+            from services.state.operation_gate import plugin_tool_owns_play
+
+            if not await plugin_tool_owns_play(tool_name, unity_instance, user_id):
+                return False
+
+            from services.state.play_lease import (
+                play_lease_manager,
+                record_play_intent_for_session,
+            )
+
+            lease = play_lease_manager.get_active_lease(unity_instance)
+            if lease is not None and lease.owner_key == await self.get_session_key(ctx):
+                # Already this session's play session: the gate renews it and
+                # there is nothing to attribute.
+                return False
+            await record_play_intent_for_session(ctx, unity_instance)
+            return True
+        except Exception as exc:
+            if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+                raise
+            _diag.debug(
+                "plugin play-intent recording failed open (%s)",
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return False
+
+    async def _drop_plugin_play_intent(self, context) -> None:
+        """Drop the pending plugin play intent of this session. Fails open."""
+        try:
+            ctx = context.fastmcp_context
+            unity_instance, _ = await self._gate_state(ctx)
+
+            from services.state.play_lease import clear_play_intent_for_session
+
+            await clear_play_intent_for_session(ctx, unity_instance)
+        except Exception as exc:
+            if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+                raise
+            _diag.debug(
+                "plugin play-intent clear failed open (%s)",
+                type(exc).__name__,
+                exc_info=True,
+            )
+
+    async def _settle_plugin_play_edge(self, context) -> None:
+        """Attribute a play edge that only settled after the plugin dispatch.
+
+        Runs whatever the call returned: the same pass drops the pre-recorded
+        intent when the snapshot shows no play edge, so a plugin call that
+        never entered play leaves nothing behind. Fails open.
+        """
+        try:
+            ctx = context.fastmcp_context
+            unity_instance, _ = await self._gate_state(ctx)
+
+            from services.state.operation_gate import (
+                record_exclusive_edge_after_arbitrary_code,
+            )
+
+            await record_exclusive_edge_after_arbitrary_code(ctx, unity_instance)
+        except Exception as exc:
+            if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+                raise
+            _diag.debug(
+                "plugin play-edge attribution failed open (%s)",
                 type(exc).__name__,
                 exc_info=True,
             )

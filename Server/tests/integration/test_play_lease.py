@@ -435,6 +435,127 @@ class TestWrapperPlayAttribution:
         assert lease.owner_display == "user"
 
 
+class TestPluginToolPlayAttribution:
+    """A bridge-registered plugin tool declaring a play-owning class dispatches
+    through the per-tool middleware, not the custom-tool wrapper. Its play
+    transition is invisible to argument inspection, so the dispatch records an
+    intent for the CALLING session — otherwise the lease falls through to
+    "user" and the driver's own play-scoped calls (its cleanup stop included)
+    are refused as non-owner."""
+
+    @staticmethod
+    async def _register_driver(name="test_driver", concurrency_class="play-scoped"):
+        registry = await _register_instance()
+        await registry.register_tools_for_session("guid-1", [
+            ToolDefinitionModel(name=name, concurrency_class=concurrency_class),
+        ])
+        return registry
+
+    @pytest.mark.asyncio
+    async def test_dispatched_play_scoped_plugin_tool_leases_to_caller(
+        self, monkeypatch,
+    ):
+        """The editor is idle when the driver is gated and playing when it
+        returns: the settled edge attributes to the caller, not 'user'."""
+        await self._register_driver()
+        editor_state_cache.reset(ttl_s=0.0)
+        _inject_state(monkeypatch, FakeEditorState(IDLE_STATE, PLAYING_STATE))
+
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        ctx_a = DummyContext()
+        await middleware.set_active_instance(ctx_a, INSTANCE)
+
+        result = await _middleware_call(
+            middleware, ctx_a, "test_driver", {"action": "run_script"},
+            {"success": True, "message": "Test script completed."},
+        )
+
+        assert result["success"] is True
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease is not None
+        assert lease.owner_key == ctx_a.session_id
+        assert lease.owner_display != "user"
+
+    @pytest.mark.asyncio
+    async def test_owner_can_stop_the_play_session_it_started(self, monkeypatch):
+        """The self-deadlock this closes: after the driver's own play session
+        is leased to it, the session's cleanup stop is not refused."""
+        await self._register_driver()
+        editor_state_cache.reset(ttl_s=0.0)
+        _inject_state(monkeypatch, FakeEditorState(IDLE_STATE, PLAYING_STATE))
+
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        ctx_a = DummyContext()
+        await middleware.set_active_instance(ctx_a, INSTANCE)
+
+        await _middleware_call(
+            middleware, ctx_a, "test_driver", {"action": "run_script"},
+            {"success": True, "message": "Test script completed."},
+        )
+
+        assert await gate_tool_call(ctx_a, "manage_editor", {"action": "stop"}) is None
+
+    @pytest.mark.asyncio
+    async def test_refused_plugin_call_leaves_no_stale_intent(self, monkeypatch):
+        """A gate-refused plugin call never dispatches, so its speculative
+        intent must not survive to steal a later, unrelated play-enter."""
+        from fastmcp.exceptions import ToolError
+
+        monkeypatch.setenv("UNITY_MCP_GATE_PARK_MAX_WAIT_S", "0.2")
+        await self._register_driver()
+        editor_state_cache.reset(ttl_s=0.01)
+        _inject_state(monkeypatch, FakeEditorState({
+            "compilation": {"is_compiling": True}, "editor": {}, "tests": {},
+        }))
+
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        ctx_a = DummyContext()
+        await middleware.set_active_instance(ctx_a, INSTANCE)
+
+        with pytest.raises(ToolError):
+            await _middleware_call(
+                middleware, ctx_a, "test_driver", {"action": "run_script"},
+                {"success": True, "message": "Test script completed."},
+            )
+
+        assert play_lease_manager._intents == {}
+
+        # A later human play-enter (no MCP cause) still resolves to "user".
+        editor_state_cache.reset(ttl_s=0.0)
+        _inject_state(monkeypatch, FakeEditorState(PLAYING_STATE))
+        await editor_state_cache.get(DummyContext(), INSTANCE)
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease is not None
+        assert lease.owner_display == "user"
+
+    @pytest.mark.asyncio
+    async def test_plain_plugin_tool_records_no_intent(self, monkeypatch):
+        """Only play-owning classes attribute: a mutate-class plugin tool
+        leaves a concurrent human play-enter attributed to 'user'."""
+        await self._register_driver(name="gameplay_query", concurrency_class="mutate")
+        editor_state_cache.reset(ttl_s=0.0)
+        _inject_state(monkeypatch, FakeEditorState(IDLE_STATE, PLAYING_STATE))
+
+        middleware = UnityInstanceMiddleware()
+        set_unity_instance_middleware(middleware)
+        ctx_a = DummyContext()
+        await middleware.set_active_instance(ctx_a, INSTANCE)
+
+        await _middleware_call(
+            middleware, ctx_a, "gameplay_query", {"action": "tags"},
+            {"success": True, "message": "ok"},
+        )
+        await editor_state_cache.get(DummyContext(), INSTANCE)
+
+        lease = play_lease_manager.get_active_lease(INSTANCE)
+        assert lease is not None
+        assert lease.owner_key is None
+        assert lease.owner_display == "user"
+
+
 # ----------------------------------------------------------------------
 # Non-owner enforcement (MCPC-013/014/015)
 # ----------------------------------------------------------------------

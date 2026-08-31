@@ -350,6 +350,36 @@ async def resolve_tool_class(
     return DEFAULT_CONCURRENCY_CLASS
 
 
+async def plugin_tool_owns_play(
+    tool_name: str,
+    unity_instance: str | None,
+    user_id: str | None,
+) -> bool:
+    """Whether a bridge-registered (plugin) tool declares a play-owning class.
+
+    Server-registered tools answer False: their play attribution is owned by
+    their own call sites (``manage_editor``'s dispatch intent, ``run_tests``'s
+    test-job ownership). A plugin tool is the case nothing else covers — the
+    server knows only its declared class, so a ``play-scoped`` / ``exclusive``
+    one is taken as a play cause. Fails open (False).
+    """
+    try:
+        _refresh_registry_maps()
+        if tool_name in _registry_class_by_name:
+            return False
+        declared = await _bridge_declared_class(tool_name, unity_instance, user_id)
+        if declared is None:
+            return False
+        return normalize_class(declared) in (CLASS_PLAY_SCOPED, CLASS_EXCLUSIVE)
+    except Exception as exc:
+        logger.debug(
+            "operation_gate: plugin play-class lookup failed for '%s' (fail-open): %r",
+            tool_name,
+            exc,
+        )
+        return False
+
+
 # ----------------------------------------------------------------------
 # Budgets and pacing
 # ----------------------------------------------------------------------
